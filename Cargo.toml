@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lumien-protocol",
+    "crates/lumien-device",
+    "crates/lumien-cli",
+]

@@ -1,0 +1,62 @@
+{
+  "height": 1080,
+  "name": "Main",
+  "version": 2,
+  "widgets": [
+    {
+      "background": "#18262e",
+      "binding": "CPU load",
+      "color": "#ffffff",
+      "fontSize": 64,
+      "height": 220,
+      "id": "82d2af6a-d131-418a-8354-9a8eaeb06455",
+      "image": "",
+      "kind": "Metric value",
+      "locked": false,
+      "name": "CPU Load",
+      "text": "CPU LOAD",
+      "value": 2,
+      "visible": true,
+      "width": 420,
+      "x": 1377,
+      "y": 76
+    },
+    {
+      "background": "#18262e",
+      "binding": "GPU load",
+      "color": "#ffffff",
+      "fontSize": 64,
+      "height": 220,
+      "id": "84cb45e5-3a00-4dfb-9d2b-0e719255426a",
+      "image": "",
+      "kind": "Metric value",
+      "locked": false,
+      "name": "GPU Load",
+      "text": "GPU LOAD",
+      "value": 17,
+      "visible": true,
+      "width": 420,
+      "x": 1381,
+      "y": 413
+    },
+    {
+      "background": "#18262e",
+      "binding": "GPU temperature",
+      "color": "#ffffff",
+      "fontSize": 64,
+      "height": 220,
+      "id": "3d44216b-80e5-4378-9091-724cf0bd01aa",
+      "image": "",
+      "kind": "Metric value",
+      "locked": false,
+      "name": "GPU Temperature",
+      "text": "GPU TEMP",
+      "value": 56,
+      "visible": true,
+      "width": 420,
+      "x": 1380,
+      "y": 706
+    }
+  ],
+  "width": 2240
+}

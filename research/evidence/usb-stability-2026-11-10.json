@@ -1,0 +1,14 @@
+﻿{
+    "started":  "2026-11-10T12:43:51.1112422-05:00",
+    "targetProcessId":  9004,
+    "expectedPath":  "C:\\Users\\Alexis\\code\\lumien\\target\\usb-disconnect-fix\\debug\\lumien-app.exe",
+    "durationSeconds":  600,
+    "elapsedSeconds":  625.9,
+    "ticks":  638,
+    "result":  "passed",
+    "reason":  "",
+    "lastTick":  "[2026-11-10 12:54:17.320] [SYNC ] Tick OK: Out 79B (38.4µs), In 13B (5.9762ms) [CPU: 3%, GPU: 49°C/3%, RAM: 39%]",
+    "finished":  "2026-11-10T12:54:22.2608034-05:00",
+    "finalPnPStatus":  "OK",
+    "observationNote":  "Stopped read-only observer at user-requested ten-minute checkpoint; patched Lumien remains running."
+}

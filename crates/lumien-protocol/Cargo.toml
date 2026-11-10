@@ -1,0 +1,8 @@
+[package]
+name = "lumien-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust wire codec and protocol parser for TRYX Panorama display controllers"
+
+[dependencies]
+# ponytail: zero external dependencies for wire framing and minimal protobuf varints. Upgrade to prost if schema grows.

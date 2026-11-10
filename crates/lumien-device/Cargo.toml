@@ -1,0 +1,9 @@
+[package]
+name = "lumien-device"
+version = "0.1.0"
+edition = "2021"
+description = "Narrow Win32 asynchronous USB transport for TRYX Panorama display controllers"
+
+[dependencies]
+lumien-protocol = { path = "../lumien-protocol" }
+# ponytail: direct Win32 extern FFI bindings used for kernel32 / setupapi; zero external crate dependencies.

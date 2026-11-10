@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "name": "Invalid layout with gauge",
+  "width": 2240,
+  "height": 1080,
+  "widgets": [
+    {
+      "id": "gauge-1",
+      "kind": "Gauge",
+      "name": "GPU load",
+      "x": 600,
+      "y": 200,
+      "width": 440,
+      "height": 240,
+      "visible": true,
+      "locked": false,
+      "text": "GPU LOAD",
+      "color": "#67e8d0",
+      "background": "#18262e",
+      "fontSize": 64,
+      "value": 72,
+      "binding": "GPU load",
+      "image": ""
+    }
+  ]
+}

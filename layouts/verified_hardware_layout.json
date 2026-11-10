@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "name": "Lumien Controlled Layout",
+  "width": 2240,
+  "height": 1080,
+  "widgets": [
+    {
+      "id": "widget-1",
+      "kind": "Metric value",
+      "name": "CPU Temperature",
+      "x": 100,
+      "y": 200,
+      "width": 440,
+      "height": 240,
+      "visible": true,
+      "locked": false,
+      "text": "LUMIEN CPU",
+      "color": "#67e8d0",
+      "background": "#18262e",
+      "fontSize": 64,
+      "value": 45,
+      "binding": "CPU temperature",
+      "image": ""
+    }
+  ]
+}
