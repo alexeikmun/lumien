@@ -9,6 +9,8 @@ import {
   parseScene,
   kinds,
   profile,
+  fontFamilies,
+  getCssFontFamily,
   type Scene,
   type Widget,
   type Kind,
@@ -16,19 +18,39 @@ import {
 import { device } from './adapter';
 import { invoke } from '@tauri-apps/api/core';
 import { historyReducer, initialHistory, withTelemetry, takeStartupScene } from './editor';
+import { sensors, isNetwork, metricMax, formatMetric } from './metrics';
 import './style.css';
 
-function Preview({ w }: { w: Widget }) {
+function Preview({ w, readings }: { w: Widget; readings: Record<string, number | null> }) {
+  const key = sensors.find(s => s.binding === w.binding)?.key;
+  const available = !isNetwork(w.binding) || (key && readings[key] != null);
+  const metric = formatMetric(w.binding, available ? w.value : null);
+  const fontFam = getCssFontFamily(w.fontFamily);
+  const fam = (w.fontFamily || 'roboto').toLowerCase();
+  const isRoboto = fam === 'roboto' || fam === 'roboto-black';
+  const isBlack = fam === 'roboto-black';
+  const fontStyle = isRoboto && w.italic ? 'italic' : 'normal';
+  const fontWeight = isBlack ? 900 : isRoboto && w.bold ? 700 : 400;
+
   return (
-    <div className="widget" style={{ background: w.background, color: w.color, fontSize: w.fontSize }}>
+    <div
+      className="widget"
+      style={{
+        background: w.background,
+        color: w.color,
+        fontSize: w.fontSize,
+        fontFamily: fontFam,
+        fontStyle,
+      }}
+    >
       {w.kind === 'Text' ? (
-        <div style={{ fontWeight: 600 }}>{w.text}</div>
+        <div style={{ fontWeight }}>{w.text}</div>
       ) : (
         <>
-          <small>{w.text}</small>
-          <strong>
-            {w.value}
-            <em>{w.binding.toLowerCase().includes('temp') ? '°C' : '%'}</em>
+          <small style={{ fontWeight }}>{w.text}</small>
+          <strong style={{ fontWeight }}>
+            {metric.text}
+            <em style={{ fontStyle: isRoboto && w.italic ? 'italic' : 'normal' }}>{metric.unit}</em>
           </strong>
         </>
       )}
@@ -45,15 +67,11 @@ function App() {
     [fileBusy, setFileBusy] = useState(desktop),
     [starting, setStarting] = useState(desktop),
     [fileError, setFileError] = useState<string | null>(null),
-    [readings, setReadings] = useState<Record<string, number>>({}),
+    [readings, setReadings] = useState<Record<string, number | null>>({}),
     [pending, setPending] = useState<'new' | { scene: Scene; path: string } | null>(null),
     [zoom, setZoom] = useState(1),
     [fit, setFit] = useState(0.4),
     [pan, setPan] = useState({ x: 0, y: 0 }),
-    [grid, setGrid] = useState(true),
-    [snap, setSnap] = useState(false),
-    [division, setDivision] = useState(true),
-    [bend, setBend] = useState(true),
     [status, setStatus] = useState('Ready'),
     [busy, setBusy] = useState(false),
     [deviceState, setDeviceState] = useState<{ connected: boolean; message: string }>({
@@ -74,7 +92,11 @@ function App() {
   const w = scene.widgets.find((v) => v.id === selected),
     scale = fit * zoom,
     dirty = !starting && saved !== JSON.stringify(scene),
-    previewScene = withTelemetry(scene, readings);
+    previewScene = withTelemetry(scene, readings),
+    grid = scene.grid ?? true,
+    snap = scene.snap ?? false,
+    division = scene.split ?? true,
+    bend = scene.bend ?? true;
 
   useEffect(() => {
     if (!desktop) return;
@@ -150,7 +172,7 @@ function App() {
   useEffect(() => {
     let active = true;
     const poll = async () => {
-      if (!deviceState.connected) return;
+      if (!desktop) return;
       try {
         const telemetry = await device.getTelemetry();
         if (!active || Object.keys(telemetry).length === 0) return;
@@ -164,7 +186,7 @@ function App() {
       active = false;
       clearInterval(id);
     };
-  }, [deviceState.connected]);
+  }, [desktop]);
 
   function commit(next: Scene) {
     dispatch({ type: 'commit', scene: next });
@@ -213,7 +235,7 @@ function App() {
       name,
       x: 120 + offset,
       y: 120 + offset,
-      width: 420,
+      width: isNetwork(binding) ? 600 : 420,
       height: 220,
       visible: true,
       locked: false,
@@ -224,6 +246,9 @@ function App() {
       value: 0,
       binding,
       image: '',
+      fontFamily: 'roboto',
+      bold: false,
+      italic: false,
     });
     commit({ ...scene, widgets: [...scene.widgets, a] });
     select(a.id);
@@ -521,23 +546,17 @@ function App() {
           </div>
           <div className="section-heading" style={{ marginTop: '20px' }}>
             <h2>AVAILABLE SENSORS</h2>
-            <span>5</span>
+            <span>{sensors.length}</span>
           </div>
           <div className="sensor-list" style={{ display: 'flex', flexDirection: 'column', gap: '6px', margin: '8px 0 16px' }}>
-            {[
-              { name: 'CPU Load', binding: 'CPU load', text: 'CPU LOAD', color: '#ffffff' },
-              { name: 'CPU Temp', binding: 'CPU temperature', text: 'CPU TEMP', color: '#ffffff' },
-              { name: 'GPU Load', binding: 'GPU load', text: 'GPU LOAD', color: '#ffffff' },
-              { name: 'GPU Temp', binding: 'GPU temperature', text: 'GPU TEMP', color: '#ffffff' },
-              { name: 'Memory Usage', binding: 'Memory usage', text: 'MEMORY', color: '#ffffff' },
-            ].map((s) => (
+            {sensors.map((s) => (
               <button
                 key={s.binding}
                 style={{ textAlign: 'left', padding: '6px 10px', fontSize: '11px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                onClick={() => addSensor(s.binding, s.name, s.text, s.color)}
+                onClick={() => addSensor(s.binding, s.name, s.text)}
               >
                 <span>+ {s.name}</span>
-                <small style={{ color: s.color, fontWeight: 600 }}>{s.binding.toLowerCase().includes('temp') ? '°C' : '%'}</small>
+                <small style={{ color: '#ffffff', fontWeight: 600 }}>{formatMetric(s.binding, null).unit}</small>
               </button>
             ))}
           </div>
@@ -555,19 +574,19 @@ function App() {
               DISPLAY <b>2240 × 1080</b>
             </span>
             <label>
-              <input type="checkbox" checked={grid} onChange={(e) => setGrid(e.target.checked)} />
+              <input type="checkbox" checked={grid} onChange={(e) => commit({ ...scene, grid: e.target.checked })} />
               Grid
             </label>
             <label>
-              <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} />
+              <input type="checkbox" checked={snap} onChange={(e) => commit({ ...scene, snap: e.target.checked })} />
               Snap
             </label>
             <label>
-              <input type="checkbox" checked={division} onChange={(e) => setDivision(e.target.checked)} />
+              <input type="checkbox" checked={division} onChange={(e) => commit({ ...scene, split: e.target.checked })} />
               Split
             </label>
             <label>
-              <input type="checkbox" checked={bend} onChange={(e) => setBend(e.target.checked)} />
+              <input type="checkbox" checked={bend} onChange={(e) => commit({ ...scene, bend: e.target.checked })} />
               Bend
             </label>
             <button onClick={() => setZoom((z) => Math.max(0.25, z / 1.25))}>−</button>
@@ -666,7 +685,7 @@ function App() {
                       viewport.current!.setPointerCapture(e.pointerId);
                     }}
                   >
-                    <Preview w={previewScene.widgets.find(a => a.id === v.id)!} />
+                    <Preview w={previewScene.widgets.find(a => a.id === v.id)!} readings={readings} />
                     {selected === v.id && !v.locked && (
                       <button
                         aria-label="Resize selected widget"
@@ -734,6 +753,44 @@ function App() {
                 <input maxLength={500} value={w.text} onChange={(e) => patch({ text: e.target.value })} />
               </label>
               <label>
+                Font Family
+                <select value={w.fontFamily || 'roboto'} onChange={(e) => patch({ fontFamily: e.target.value })}>
+                  {fontFamilies.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {(() => {
+                const fam = (w.fontFamily || 'roboto').toLowerCase();
+                const isNonRoboto = fam === 'orbitron' || fam === 'bitcount-single' || fam === 'rubik-glitch';
+                const isBlack = fam === 'roboto-black';
+                return (
+                  <>
+                    <label style={{ opacity: isNonRoboto || isBlack ? 0.6 : 1 }}>
+                      <input
+                        type="checkbox"
+                        checked={isBlack ? true : Boolean(w.bold)}
+                        disabled={isNonRoboto || isBlack}
+                        onChange={(e) => patch({ bold: e.target.checked })}
+                      />
+                      Bold
+                    </label>
+                    {isNonRoboto && (
+                      <small style={{ color: '#88a0b0', fontSize: '11px', display: 'block', marginTop: '-6px' }}>
+                        Hardware SoC only includes Regular weight for this font.
+                      </small>
+                    )}
+                    {isBlack && (
+                      <small style={{ color: '#88a0b0', fontSize: '11px', display: 'block', marginTop: '-6px' }}>
+                        Roboto Black is ultra-heavy bold (weight 900).
+                      </small>
+                    )}
+                  </>
+                );
+              })()}
+              <label>
                 Font Size
                 <input
                   type="number"
@@ -747,10 +804,6 @@ function App() {
                 Accent Color
                 <input type="color" value={w.color} onChange={(e) => patch({ color: e.target.value })} />
               </label>
-              <label>
-                Background Color
-                <input type="color" value={w.background} onChange={(e) => patch({ background: e.target.value })} />
-              </label>
 
               {w.kind === 'Metric value' && (
                 <>
@@ -763,25 +816,23 @@ function App() {
                         patch({
                           binding: e.target.value,
                           text: e.target.value.toUpperCase(),
+                          value: Math.min(w.value, metricMax(e.target.value)),
                         })
                       }
                     >
-                      <option value="CPU load">CPU Load (%)</option>
-                      <option value="CPU temperature">CPU Temperature (°C)</option>
-                      <option value="GPU load">GPU Load (%)</option>
-                      <option value="GPU temperature">GPU Temperature (°C)</option>
-                      <option value="Memory usage">Memory Usage (%)</option>
+                      {sensors.map(s => <option key={s.binding} value={s.binding}>{s.name} ({formatMetric(s.binding, null).unit})</option>)}
                     </select>
                   </label>
                   <label>
-                    Fallback Value
+                    Fallback Value {isNetwork(w.binding) ? '(bytes/s)' : ''}
                     <input
                       type="number"
                       min={0}
-                      max={100}
+                      max={metricMax(w.binding)}
+                      step={isNetwork(w.binding) ? 'any' : 1}
                       value={w.value}
                       onChange={(e) => {
-                        const value = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+                        const value = Math.max(0, Math.min(metricMax(w.binding), Number(e.target.value) || 0));
                         patch({ value });
                       }}
                     />
@@ -809,6 +860,10 @@ function App() {
       </div>
     </div>
   );
+}
+
+if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === false) {
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

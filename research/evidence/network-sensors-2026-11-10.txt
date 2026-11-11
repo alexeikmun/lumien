@@ -1,0 +1,66 @@
+[2026-11-10 13:56:20.796] [INFO ] Encoding scene 'Main + Network' (5 widgets)...
+[2026-11-10 13:56:21.209] [INFO ] Background telemetry loop stopped.
+[2026-11-10 13:56:21.284] [INFO ] Device opened for apply_scene.
+[2026-11-10 13:56:21.284] [WRITE] RunConfig (715 bytes) in 48µs
+[2026-11-10 13:56:21.291] [READ ] RunConfig ACK (13 bytes) in 7.462ms | Hex: 0A 02 08 01 12 00 C2 25 04 0A 02 6F 6B
+[2026-11-10 13:56:21.292] [INFO ] Background 1 Hz telemetry loop started (not a verified firmware keepalive).
+[2026-11-10 13:56:21.292] [INFO ] Telemetry worker owns acknowledged layout handle.
+[2026-11-10 13:56:22.301] [SYNC ] Tick OK: Out 103B (49.1µs), In 13B (6.6924ms) [CPU: 2%, GPU: 55°C/15%, RAM: 49%]
+[2026-11-10 13:56:23.309] [SYNC ] Tick OK: Out 100B (40.4µs), In 13B (7.6895ms) [CPU: 8%, GPU: 54°C/22%, RAM: 49%]
+[2026-11-10 13:56:24.318] [SYNC ] Tick OK: Out 106B (45µs), In 13B (8.0862ms) [CPU: 5%, GPU: 54°C/21%, RAM: 49%]
+[2026-11-10 13:56:25.325] [SYNC ] Tick OK: Out 106B (36.2µs), In 13B (6.2449ms) [CPU: 3%, GPU: 55°C/14%, RAM: 49%]
+[2026-11-10 13:56:26.333] [SYNC ] Tick OK: Out 105B (43.4µs), In 13B (7.848ms) [CPU: 4%, GPU: 55°C/15%, RAM: 49%]
+[2026-11-10 13:56:27.342] [SYNC ] Tick OK: Out 102B (37.6µs), In 13B (6.4026ms) [CPU: 2%, GPU: 55°C/15%, RAM: 49%]
+[2026-11-10 13:56:28.348] [SYNC ] Tick OK: Out 106B (37.7µs), In 13B (5.5746ms) [CPU: 3%, GPU: 55°C/15%, RAM: 49%]
+[2026-11-10 13:56:29.355] [SYNC ] Tick OK: Out 104B (53.2µs), In 13B (5.9617ms) [CPU: 4%, GPU: 55°C/21%, RAM: 49%]
+[2026-11-10 13:56:30.363] [SYNC ] Tick OK: Out 102B (39.3µs), In 13B (7.0602ms) [CPU: 2%, GPU: 55°C/21%, RAM: 49%]
+[2026-11-10 13:56:31.372] [SYNC ] Tick OK: Out 106B (41.4µs), In 13B (7.9268ms) [CPU: 10%, GPU: 55°C/21%, RAM: 49%]
+[2026-11-10 13:56:32.379] [SYNC ] Tick OK: Out 103B (37.7µs), In 13B (4.8473ms) [CPU: 9%, GPU: 55°C/21%, RAM: 49%]
+[2026-11-10 13:56:33.386] [SYNC ] Tick OK: Out 104B (49.8µs), In 13B (5.7678ms) [CPU: 4%, GPU: 55°C/21%, RAM: 49%]
+[2026-11-10 13:56:34.392] [SYNC ] Tick OK: Out 102B (36.9µs), In 13B (5.3214ms) [CPU: 3%, GPU: 55°C/21%, RAM: 49%]
+[2026-11-10 13:56:35.400] [SYNC ] Tick OK: Out 104B (35µs), In 13B (6.4399ms) [CPU: 5%, GPU: 55°C/22%, RAM: 49%]
+[2026-11-10 13:56:36.408] [SYNC ] Tick OK: Out 106B (51.5µs), In 13B (6.6888ms) [CPU: 8%, GPU: 55°C/22%, RAM: 49%]
+[2026-11-10 13:56:37.415] [SYNC ] Tick OK: Out 101B (43.8µs), In 13B (6.4837ms) [CPU: 13%, GPU: 55°C/22%, RAM: 50%]
+[2026-11-10 13:56:38.424] [SYNC ] Tick OK: Out 105B (35.3µs), In 13B (8.4227ms) [CPU: 8%, GPU: 55°C/22%, RAM: 49%]
+[2026-11-10 13:56:39.431] [SYNC ] Tick OK: Out 104B (48.7µs), In 13B (5.4504ms) [CPU: 6%, GPU: 55°C/11%, RAM: 49%]
+[2026-11-10 13:56:40.437] [SYNC ] Tick OK: Out 101B (47.2µs), In 13B (5.0874ms) [CPU: 9%, GPU: 54°C/9%, RAM: 49%]
+[2026-11-10 13:56:41.445] [SYNC ] Tick OK: Out 105B (42.1µs), In 13B (6.4583ms) [CPU: 5%, GPU: 54°C/10%, RAM: 49%]
+[2026-11-10 13:56:42.452] [SYNC ] Tick OK: Out 96B (41µs), In 13B (6.5399ms) [CPU: 2%, GPU: 54°C/8%, RAM: 49%]
+[2026-11-10 13:56:43.462] [SYNC ] Tick OK: Out 107B (32.1µs), In 13B (7.7692ms) [CPU: 6%, GPU: 54°C/12%, RAM: 49%]
+[2026-11-10 13:56:44.470] [SYNC ] Tick OK: Out 100B (42.8µs), In 13B (7.8261ms) [CPU: 3%, GPU: 55°C/12%, RAM: 49%]
+[2026-11-10 13:56:45.477] [SYNC ] Tick OK: Out 104B (41.3µs), In 13B (5.4286ms) [CPU: 3%, GPU: 54°C/9%, RAM: 49%]
+[2026-11-10 13:56:46.485] [SYNC ] Tick OK: Out 102B (47.2µs), In 13B (6.8246ms) [CPU: 3%, GPU: 54°C/12%, RAM: 49%]
+[2026-11-10 13:56:47.492] [SYNC ] Tick OK: Out 102B (56.1µs), In 13B (6.7697ms) [CPU: 4%, GPU: 54°C/10%, RAM: 49%]
+[2026-11-10 13:56:48.501] [SYNC ] Tick OK: Out 105B (38µs), In 13B (7.3622ms) [CPU: 5%, GPU: 54°C/11%, RAM: 49%]
+[2026-11-10 13:56:49.509] [SYNC ] Tick OK: Out 105B (40.1µs), In 13B (6.5219ms) [CPU: 10%, GPU: 54°C/7%, RAM: 49%]
+[2026-11-10 13:56:50.517] [SYNC ] Tick OK: Out 100B (49.2µs), In 13B (6.9423ms) [CPU: 10%, GPU: 54°C/7%, RAM: 49%]
+[2026-11-10 13:56:51.525] [SYNC ] Tick OK: Out 102B (37.2µs), In 13B (7.6834ms) [CPU: 26%, GPU: 54°C/7%, RAM: 53%]
+[2026-11-10 13:56:52.534] [SYNC ] Tick OK: Out 105B (47.5µs), In 13B (7.1676ms) [CPU: 13%, GPU: 54°C/7%, RAM: 49%]
+[2026-11-10 13:56:53.542] [SYNC ] Tick OK: Out 100B (39.4µs), In 13B (6.5015ms) [CPU: 7%, GPU: 55°C/12%, RAM: 49%]
+[2026-11-10 13:56:54.551] [SYNC ] Tick OK: Out 104B (36µs), In 13B (7.3236ms) [CPU: 0%, GPU: 55°C/10%, RAM: 49%]
+[2026-11-10 13:56:55.557] [SYNC ] Tick OK: Out 101B (40.6µs), In 13B (5.6329ms) [CPU: 6%, GPU: 55°C/9%, RAM: 49%]
+[2026-11-10 13:56:56.565] [SYNC ] Tick OK: Out 101B (40.4µs), In 13B (6.8639ms) [CPU: 5%, GPU: 54°C/7%, RAM: 49%]
+[2026-11-10 13:56:57.572] [SYNC ] Tick OK: Out 100B (43.3µs), In 13B (6.615ms) [CPU: 10%, GPU: 54°C/8%, RAM: 49%]
+[2026-11-10 13:56:58.580] [SYNC ] Tick OK: Out 101B (34.2µs), In 13B (6.9929ms) [CPU: 3%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:56:59.588] [SYNC ] Tick OK: Out 106B (35.3µs), In 13B (6.9528ms) [CPU: 11%, GPU: 54°C/7%, RAM: 49%]
+[2026-11-10 13:57:00.594] [SYNC ] Tick OK: Out 104B (47.6µs), In 13B (5.6681ms) [CPU: 0%, GPU: 55°C/11%, RAM: 49%]
+[2026-11-10 13:57:01.601] [SYNC ] Tick OK: Out 105B (57.8µs), In 13B (6.4177ms) [CPU: 3%, GPU: 55°C/11%, RAM: 49%]
+[2026-11-10 13:57:02.609] [SYNC ] Tick OK: Out 101B (35.1µs), In 13B (5.9382ms) [CPU: 2%, GPU: 55°C/7%, RAM: 49%]
+[2026-11-10 13:57:03.616] [SYNC ] Tick OK: Out 104B (43.2µs), In 13B (6.0039ms) [CPU: 0%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:04.622] [SYNC ] Tick OK: Out 101B (38.8µs), In 13B (5.8232ms) [CPU: 3%, GPU: 55°C/6%, RAM: 49%]
+[2026-11-10 13:57:05.632] [SYNC ] Tick OK: Out 101B (34.7µs), In 13B (7.6583ms) [CPU: 5%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:05.749] [INFO ] Encoding scene 'Main + Network' (5 widgets)...
+[2026-11-10 13:57:06.633] [INFO ] Background telemetry loop stopped.
+[2026-11-10 13:57:06.699] [INFO ] Device opened for apply_scene.
+[2026-11-10 13:57:06.699] [WRITE] RunConfig (713 bytes) in 60µs
+[2026-11-10 13:57:06.707] [READ ] RunConfig ACK (13 bytes) in 7.714ms | Hex: 0A 02 08 01 12 00 C2 25 04 0A 02 6F 6B
+[2026-11-10 13:57:06.707] [INFO ] Background 1 Hz telemetry loop started (not a verified firmware keepalive).
+[2026-11-10 13:57:06.707] [INFO ] Telemetry worker owns acknowledged layout handle.
+[2026-11-10 13:57:07.715] [SYNC ] Tick OK: Out 104B (42.2µs), In 13B (6.7675ms) [CPU: 4%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:08.722] [SYNC ] Tick OK: Out 101B (37.2µs), In 13B (5.9496ms) [CPU: 1%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:09.729] [SYNC ] Tick OK: Out 105B (51.2µs), In 13B (7.3549ms) [CPU: 2%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:10.738] [SYNC ] Tick OK: Out 101B (32.9µs), In 13B (6.4743ms) [CPU: 2%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:11.747] [SYNC ] Tick OK: Out 103B (52µs), In 13B (7.1273ms) [CPU: 2%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:12.753] [SYNC ] Tick OK: Out 101B (41.1µs), In 13B (6.1798ms) [CPU: 7%, GPU: 55°C/8%, RAM: 49%]
+[2026-11-10 13:57:13.762] [SYNC ] Tick OK: Out 102B (33.9µs), In 13B (7.3134ms) [CPU: 4%, GPU: 55°C/12%, RAM: 49%]
+[2026-11-10 13:57:14.771] [SYNC ] Tick OK: Out 101B (34.3µs), In 13B (7.1777ms) [CPU: 2%, GPU: 55°C/8%, RAM: 49%]

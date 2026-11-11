@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::time::{Duration, Instant};
+use lumien_telemetry::{NetworkSampler, format_rate, format_metric, is_network};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LayoutWidget {
@@ -26,10 +27,43 @@ pub struct LayoutWidget {
     pub background: String,
     #[serde(rename = "fontSize")]
     pub font_size: u32,
-    pub value: u32,
+    pub value: f64,
     pub binding: String,
     #[serde(default)]
     pub image: String,
+    #[serde(default = "default_font_family", rename = "fontFamily", alias = "font_family")]
+    pub font_family: String,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+}
+
+fn default_font_family() -> String {
+    "roboto".to_string()
+}
+
+fn resolve_device_font(family: &str, bold: bool, italic: bool) -> String {
+    match family.to_ascii_lowercase().as_str() {
+        "orbitron" => "Orbitron-Regular".to_string(),
+        "bitcount-single" | "bitcount" => "BitcountSingle-Regular".to_string(),
+        "rubik-glitch" | "rubik" => "RubikGlitch-Regular".to_string(),
+        "roboto-black" => {
+            if italic {
+                "roboto-blackitalic".to_string()
+            } else {
+                "roboto-black".to_string()
+            }
+        }
+        _ => {
+            match (bold, italic) {
+                (true, true) => "roboto-bolditalic".to_string(),
+                (true, false) => "roboto-bold".to_string(),
+                (false, true) => "roboto-italic".to_string(),
+                (false, false) => "roboto-regular".to_string(),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +78,7 @@ pub struct LayoutScene {
 fn print_usage() {
     eprintln!("Lumien CLI - TRYX Panorama SE Controller");
     eprintln!("Usage:");
+    eprintln!("  lumien-cli network                               Sample host download/upload speed (read-only, no USB)");
     eprintln!("  lumien-cli probe                                  Enumerate devices and verify handle acquisition");
     eprintln!("  lumien-cli check-prereqs                          Check running processes and communication prerequisites");
     eprintln!("  lumien-cli get-info                               Query device OS, firmware, and serial number (read-only)");
@@ -82,10 +117,10 @@ fn parse_hex_color(hex: &str) -> u32 {
     u32::from_str_radix(clean, 16).unwrap_or(0x67E8D0)
 }
 
-fn build_metric_group(x: u32, y: u32, width: u32, height: u32, title: &str, value_str: &str, color_hex: &str) -> LabelGroup {
+fn build_metric_group(gid: u32, x: u32, y: u32, width: u32, height: u32, title: &str, value_str: &str, color_hex: &str) -> LabelGroup {
     let color = parse_hex_color(color_hex);
     let label_title = Label {
-        label_id: 101,
+        label_id: gid + 1,
         line: 1,
         order: 0,
         gap_left: 12,
@@ -98,7 +133,7 @@ fn build_metric_group(x: u32, y: u32, width: u32, height: u32, title: &str, valu
         text: title.to_string(),
     };
     let label_val = Label {
-        label_id: 102,
+        label_id: gid + 2,
         line: 0,
         order: 1,
         gap_left: 0,
@@ -111,7 +146,7 @@ fn build_metric_group(x: u32, y: u32, width: u32, height: u32, title: &str, valu
         text: value_str.to_string(),
     };
     let label_unit = Label {
-        label_id: 103,
+        label_id: gid + 3,
         line: 0,
         order: 2,
         gap_left: 4,
@@ -125,7 +160,7 @@ fn build_metric_group(x: u32, y: u32, width: u32, height: u32, title: &str, valu
     };
 
     LabelGroup {
-        group_id: 100,
+        group_id: gid,
         group_x: x,
         group_y: y,
         group_width: width,
@@ -211,6 +246,21 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "network" => {
+            let mut sampler = NetworkSampler::default();
+            if let Err(error) = sampler.sample() { eprintln!("Network counters unavailable: {error}"); std::process::exit(1); }
+            std::thread::sleep(Duration::from_secs(1));
+            match sampler.sample() {
+                Ok(Some(rates)) => {
+                    let (down, down_unit) = format_rate(Some(rates.download));
+                    let (up, up_unit) = format_rate(Some(rates.upload));
+                    println!("Active physical Ethernet/Wi-Fi adapters (combined):");
+                    println!("Download: {down} {down_unit} ({:.0} bytes/s)", rates.download);
+                    println!("Upload:   {up} {up_unit} ({:.0} bytes/s)", rates.upload);
+                }
+                other => { eprintln!("Network counters unavailable: {other:?}"); std::process::exit(1); }
+            }
+        }
         "probe" => {
             println!("=== Lumien Device Probe ===");
             let devices = enumerate_devices();
@@ -294,6 +344,7 @@ fn main() {
             let mut y = 200u32;
             let mut text = "LUMIEN CPU".to_string();
             let mut val = "42".to_string();
+            let mut font = "roboto-regular".to_string();
 
             let mut i = 2;
             while i < args.len() {
@@ -302,6 +353,7 @@ fn main() {
                     "--y" if i + 1 < args.len() => { y = args[i + 1].parse().unwrap_or(200); i += 1; }
                     "--text" if i + 1 < args.len() => { text = args[i + 1].clone(); i += 1; }
                     "--val" if i + 1 < args.len() => { val = args[i + 1].clone(); i += 1; }
+                    "--font" if i + 1 < args.len() => { font = args[i + 1].clone(); i += 1; }
                     _ => {}
                 }
                 i += 1;
@@ -309,9 +361,12 @@ fn main() {
 
             println!("=== Lumien Apply Widget (Tag 201 RunConfigPb) ===");
             println!("Target coordinates: ({}, {}) | Dimensions: 440 x 240 px", x, y);
-            println!("Widget Title: '{}' | Value: '{}' | Canvas bounds: {}x{}", text, val, CANVAS_WIDTH, CANVAS_HEIGHT);
+            println!("Widget Title: '{}' | Value: '{}' | Font: '{}' | Canvas bounds: {}x{}", text, val, font, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-            let group = build_metric_group(x, y, 440, 240, &text, &val, "#67e8d0");
+            let mut group = build_metric_group(100, x, y, 440, 240, &text, &val, "#67e8d0");
+            for l in &mut group.labels {
+                l.text_font = font.clone();
+            }
             let frame = match encode_run_config_frame(&[group]) {
                 Ok(f) => f,
                 Err(e) => {
@@ -437,9 +492,12 @@ fn main() {
                 color: "#67e8d0".to_string(),
                 background: "#18262e".to_string(),
                 font_size: 64,
-                value: val,
+                value: val as f64,
                 binding: "CPU temperature".to_string(),
                 image: "".to_string(),
+                font_family: "roboto".to_string(),
+                bold: false,
+                italic: false,
             };
 
             let scene = LayoutScene {
@@ -503,8 +561,24 @@ fn main() {
                 }
                 let gid = 100 + (idx as u32 * 10);
                 let color = parse_hex_color(&w.color);
+                let device_font = resolve_device_font(&w.font_family, w.bold, w.italic);
+                if !w.value.is_finite() || w.value < 0.0 || w.value > if is_network(&w.binding) { 9_007_199_254_740_991.0 } else { 100.0 } {
+                    eprintln!("[ERROR] Invalid metric fallback value"); std::process::exit(1);
+                }
                 let group = if w.kind == "Metric value" {
-                    build_metric_group(w.x, w.y, w.width, w.height, &w.text, &w.value.to_string(), &w.color)
+                    let (text, unit) = format_metric(&w.binding, Some(w.value));
+                    let mut group = build_metric_group(gid, w.x, w.y, w.width, w.height, &w.text, &text, &w.color);
+                    let val_size = ((w.font_size as f32 * 1.65).round() as u32).clamp(16, 220);
+                    let unit_size = ((val_size as f32 * 0.65).round() as u32).clamp(12, 140);
+                    let title_size = ((w.font_size as f32 * 0.45).round() as u32).clamp(14, 60);
+                    group.labels[0].text_size = title_size;
+                    group.labels[0].text_font = device_font.clone();
+                    group.labels[1].text_size = val_size;
+                    group.labels[1].text_font = device_font.clone();
+                    group.labels[2].text = unit.into();
+                    group.labels[2].text_size = unit_size;
+                    group.labels[2].text_font = device_font;
+                    group
                 } else {
                     let label = Label {
                         label_id: gid + 1,
@@ -514,7 +588,7 @@ fn main() {
                         background: LabelBackground::None,
                         background_color: 0,
                         gradient_color: 0,
-                        text_font: "roboto-regular".to_string(),
+                        text_font: device_font,
                         text_size: w.font_size,
                         text_color: color,
                         text: w.text.clone(),

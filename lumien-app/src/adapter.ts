@@ -10,7 +10,7 @@ export interface DeviceAdapter {
   getStatus(): Promise<DeviceStatus>;
   applyScene(scene: Scene): Promise<string>;
   clearDisplay(): Promise<string>;
-  getTelemetry(): Promise<Record<string, number>>;
+  getTelemetry(): Promise<Record<string, number | null>>;
 }
 
 export class RealDeviceAdapter implements DeviceAdapter {
@@ -44,11 +44,11 @@ export class RealDeviceAdapter implements DeviceAdapter {
     return await invoke<string>('clear_display');
   }
 
-  async getTelemetry(): Promise<Record<string, number>> {
+  async getTelemetry(): Promise<Record<string, number | null>> {
     if (!this.isTauri()) {
       return {};
     }
-    return await invoke<Record<string, number>>('get_telemetry');
+    return await invoke<Record<string, number | null>>('get_telemetry');
   }
 }
 

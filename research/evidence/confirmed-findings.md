@@ -117,3 +117,21 @@ All findings listed below are backed by direct, reproducible hardware and binary
     - Dispatched 21-byte restoration frame for 25% brightness (`54 52 59 58 0d 00 00 00 0a 02 08 01 c2 0c 06 2a 04 08 01 10 19`).
     - Write completed in 440.60 µs; Read completed in 31.35 ms with `dummy_msg: "ok"`.
     - Backlight physically restored to baseline 25%. Handle closed cleanly.
+
+## EV-010: Network Sensors on Five-Widget Physical Layout
+- **Evidence Sources**: research/evidence/network-sensors-2026-11-10.{json,txt}; user physical observation on 2026-11-10: "Both visible and changing" in response to DOWNLOAD/UPLOAD verification question.
+- **Confirmed Facts**: Main + Network contains CPU load, GPU load, GPU temperature, Network download and Network upload. Device accepted 715-byte RunConfig at 13:56:21.291; captured interval contains 52 successful live update ACKs and zero errors. User confirmed DOWNLOAD and UPLOAD visible and changing on physical LCD.
+- **Limits**: Does not establish exact pixel placement, physical unit transitions, independent throughput accuracy, or extended stability. No new ten-minute soak performed.
+
+## EV-011: Device Font Mapping & TTF Variant Constraints
+- **Evidence Sources**: `device_daemon.elf` disassembly at `0x4CE74`, `0x4bc9c`, `0x4c660`, `0x3C35C`; live USB hardware transactions via `lumien-cli apply-widget`.
+- **Confirmed Facts**:
+  - Firmware indexes `/userdata/fonts` and `/usr/share/fonts` using `completeBaseName().toLower()` and filters non-alphanumeric chars.
+  - SoC contains 18 Roboto variants (`roboto-regular`, `roboto-bold`, `roboto-italic`, `roboto-black`, `roboto-blackitalic`, etc.).
+  - SoC ONLY contains `-Regular` for non-Roboto families: `Orbitron-Regular.ttf`, `BitcountSingle-Regular.ttf`, `RubikGlitch-Regular.ttf`.
+  - Transmitting non-existent variants (e.g., `Orbitron-Bold`) causes daemon verification at `0x3C35C` to trigger `RepeatedPtrField::DeleteSubrange`, logging `missing font label skipped: ... font=Orbitron-Bold partial_ok`, deleting labels from hardware screen.
+  - Transmitting `roboto-bold` or `roboto-black` yields 21-byte ACK `dummy_msg: "ok"` and renders properly on hardware.
+- **Resolution**:
+  - `resolve_device_font()` maps `orbitron`, `bitcount-single`, `rubik-glitch` strictly to their `-Regular` variants.
+  - Added `roboto-black` for heavy bold weight (weight 900 / 87 on SoC).
+  - UI Inspector disables Bold/Italic checkboxes for non-Roboto fonts and reflects regular weight in preview.

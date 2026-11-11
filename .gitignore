@@ -3,6 +3,7 @@ target/
 dist/
 out/
 node_modules/
+releases/
 
 # Temporary analysis dumps & scratch scripts
 *.log

@@ -229,3 +229,51 @@ See [usb-disconnect-investigation.md](usb-disconnect-investigation.md).
 - Without clicking Apply, startup restored Main and transmitted exactly one RunConfig at 13:25:03.155 (427 bytes); parsed OK ACK at 13:25:03.174, followed by successful live telemetry ACKs. Evidence: research/evidence/startup-apply-2026-11-10.{json,log}. This confirms automatic device transaction; physical panel observation is not inferred from ACK.
 - Tests/build: frontend 8 tests, desktop 4 tests, production TypeScript/Vite and standalone Rust builds passed. Startup gate tests cover delayed USB, once-only dispatch, edit cancellation and absent restored scene. No new dependencies. Native preflight blocks competing writers, including another Lumien process.
 - New build left running. Missing/invalid remembered file never sends sample scene; no automatic retry on uncertain write or reconnection after attempt. A changed document cancels pending startup Apply. Longer stability soak not repeated for this frontend feature.
+
+## Network speed sensors — 2026-11-10
+- Added Network download / Network upload bindings to shared seven-sensor catalog, palette and inspector. Values are bytes/s; preview and LCD format B/s, KB/s, MB/s, GB/s with matching thresholds. Unavailable/warm-up readings show --. Scene v2 unchanged; network fallbacks allow finite nonnegative rates above 100, other metrics retain prior validation.
+- New lumien-telemetry crate shared by CLI + desktop uses Windows GetIfTable2 64-bit InOctets/OutOctets via already-installed windows-sys bindings; sums operational physical Ethernet/Wi-Fi only, excludes virtual/loopback. Rate deltas use monotonic elapsed time, adapter identities, reset/hotplug handling, shared sampling cache. No admin or USB writes for host sampling.
+- Read-only CLI `lumien-cli network` sampled real traffic (357 B/s download, 415 B/s upload in initial check). Existing layout/tag-300 commands reused; initial and live network labels update numeric value and unit together. CLI multi-widget group IDs fixed at shared builder to avoid collisions.
+- Prepared layouts/main-with-network.lumien.json as separate copy of current Main plus two network widgets in unused left face; original Main file untouched. CLI dry-run successfully encoded 5 metrics, including fractional/high-rate fallback test.
+- Checks: frontend 9 tests; Rust workspace 14 tests; desktop 5 tests. Sampling/reset/hotplug math, unit boundaries, nullable readings, above-100 persistence, and LCD unit/value label IDs covered. Native UI and hardware observations recorded below.
+
+- Native UI verified in running rebuilt development app: palette shows seven sensors; opened saved Main + Network (five metrics), observed changing download/upload preview and B/s → KB/s → MB/s units. Applied through UI at 13:56:21; device returned OK RunConfig ACK (715-byte frame) and consecutive live update ACKs with no errors in captured interval. Evidence: research/evidence/network-sensors-2026-11-10.{json,txt}. Recent-layout pointer now selects separate Main + Network file; original Main preserved. User subsequently confirmed both DOWNLOAD and UPLOAD visible and changing on physical LCD; no new ten-minute soak claimed.
+- Final checks rerun: 14 workspace + 5 desktop + 9 frontend tests passed, TypeScript/Vite production build and standalone target/network-sensors desktop build passed, git diff --check clean. Next: network sensor milestone complete with user-confirmed physical rendering. If investigating rate accuracy, compare read-only lumien-cli network against Windows adapter counters; extended network-layout stability/throughput accuracy test has not been repeated.
+
+### Network units preference update — 2026-11-10
+- User requested MB/s display instead of KB/s: preview, palette, inspector, CLI and LCD now use fixed MB/s with up to two decimal places (100 KB/s → 0.1 MB/s). Raw saved rates remain bytes/s. Below 0.005 MB/s rounds to 0; unavailable remains --. Physical rendering of revised units not yet observed.
+- Verification: workspace 14, desktop 5, frontend 9 tests passed; production frontend build passed. No layout files changed.
+
+## Font Styles & Bold Rendering Resolution — 2026-11-10
+- Reverse-engineered `device_daemon.elf` font resolution at `0x4CE74` and indexing at `0x4c660`.
+- Verified SoC filesystem only contains `-Regular.ttf` for Orbitron, BitcountSingle, and RubikGlitch. Requesting `Orbitron-Bold` triggers daemon label deletion (`DeleteSubrange`) with `partial_ok`, dropping labels from physical LCD.
+- Resolved in `lumien-cli` and `lumien-app/src-tauri`: `resolve_device_font()` maps non-Roboto families to `-Regular`, preventing label deletion. Added `roboto-black` (weight 87/900) for heavy bold display on AMOLED panel.
+- Frontend Inspector disables Bold/Italic for non-Roboto families with explanatory hint; preview reflects accurate regular weight and 900 weight for Roboto Black.
+- Verified on physical hardware via `lumien-cli apply-widget --font "roboto-bold"` and `--font "roboto-black"`; both acknowledged with `ok` in ~10ms. All 14 Rust tests and 10 Node tests pass. Production frontend and desktop binaries built.
+
+## System Tray Icon & Background Execution — 2026-11-10
+- Configured Tauri 2 `tray-icon` feature in `lumien-app/src-tauri` using in-box `icons/icon.ico` resource asset.
+- Wired `on_window_event` close interception (`api.prevent_close()` + `window.hide()`) so closing or hiding the window keeps the application and background 1 Hz telemetry loop running undisturbed.
+- Configured tray left-click / double-click event handler: calls `show_main_window` (`unminimize`, `show`, `set_focus`) strictly on existing `"main"` window instance, preventing duplicate window creation.
+- Configured tray context menu with `Settings` (shows/focuses main window) and `Close` (removes tray icon, safely drops telemetry sync worker, and exits cleanly via `app.exit(0)`).
+- Verified via automated headless Win32 tests: sending `WM_CLOSE` to window hides window (`Visible: False`) while process remains alive in background (`Process alive? True`). All 14 workspace + 8 desktop + 10 frontend tests passing.
+
+## NSIS Installer Packaging (`makensis`) — 2026-11-10
+- Authored [`installer.nsi`](file:///c:/Users/Alexis/code/lumien/installer.nsi) following pattern from `code/clipped`:
+  - Solid LZMA compression.
+  - Per-user execution level (`$LOCALAPPDATA\Programs\Lumien`).
+  - Packages release `lumien-app.exe`, `lumien-cli.exe`, `README.md`, and `icon.ico`.
+  - Creates Start Menu and Desktop shortcuts with icon asset.
+  - Generates full Windows Add/Remove Programs registry entries and uninstaller (`uninstall.exe`).
+- Added [`scripts/build-installer.ps1`](file:///c:/Users/Alexis/code/lumien/scripts/build-installer.ps1):
+  - Preflights `makensis.exe` presence in PATH or Program Files.
+  - Builds Vite frontend, `lumien-app` release binary, and `lumien-cli` release binary.
+  - Runs NSIS compilation and generates standalone release zip + `SHA256SUMS.txt` in `releases/download/`.
+- Verified compilation with `makensis.exe`: produces `releases/download/lumien_0.1.0_x64-setup.exe` (2.0 MB). Installed package metadata matches product specs.
+
+## Toolbar Options Persistence (`grid`, `snap`, `split`, `bend`) — 2026-11-10
+- Added `grid`, `snap`, `split`, `bend` booleans directly into `Scene` definition in [`lumien-app/src/scene.ts`](file:///c:/Users/Alexis/code/lumien/lumien-app/src/scene.ts).
+- Default values: `grid: true`, `snap: false`, `split: true` (division line at 1120px), `bend: true` (bend overlay at 1060–1180px).
+- Fully backward compatible: `parseScene()` defaults missing fields gracefully from legacy `.lumien.json` files.
+- Connected toolbar checkboxes in [`lumien-app/src/main.tsx`](file:///c:/Users/Alexis/code/lumien/lumien-app/src/main.tsx) to document state: toggling commits changes to undo/redo history, flags document as dirty, and saves state to layout JSON on Save.
+- Verified: 11 node tests pass (including roundtrip and legacy parsing), 14 cargo workspace tests pass. Release and dev desktop binaries updated.

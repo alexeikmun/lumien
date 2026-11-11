@@ -1,0 +1,34 @@
+{
+  "date": "2026-11-10",
+  "app": "lumien-app/src-tauri/target/debug/lumien-app.exe",
+  "layout": "layouts/main-with-network.lumien.json",
+  "widgets": 5,
+  "bindings": [
+    "CPU load",
+    "GPU load",
+    "GPU temperature",
+    "Network download",
+    "Network upload"
+  ],
+  "runConfigAck": "2026-11-10 13:56:21.291",
+  "runConfigBytes": 715,
+  "successfulTicks": 52,
+  "errors": 0,
+  "previewObserved": [
+    {
+      "download": "2.14 KB/s",
+      "upload": "1.56 KB/s"
+    },
+    {
+      "download": "2.15 MB/s",
+      "upload": "16.81 KB/s"
+    },
+    {
+      "download": "182 B/s",
+      "upload": "200 B/s"
+    }
+  ],
+  "originalMainPreserved": true,
+  "physicalPanel": "User confirmed: both DOWNLOAD and UPLOAD visible and changing on physical LCD in five-widget Main + Network layout (2026-11-10).",
+  "longSoakRepeated": false
+}

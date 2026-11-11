@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { sample, parseScene, logical, geometry, createWidget, emptyScene } from './scene.ts';
 import { RealDeviceAdapter } from './adapter.ts';
 import { historyReducer, initialHistory, withTelemetry, takeStartupScene } from './editor.ts';
+import { formatMetric, sensors } from './metrics.ts';
 
 test('native coordinates invert zoom and pan', () => {
   for (const scale of [0.2, 0.5, 1, 2]) {
@@ -84,4 +85,68 @@ test('editing while waiting cancels stale startup apply; missing restored file n
   assert.equal(pending.current, null);
   assert.equal(takeStartupScene(pending, scene, true), null);
   assert.equal(takeStartupScene({ current: null }, scene, true), null);
+});
+
+test('network byte rates format and persist above percentage limits', () => {
+  const scene = emptyScene();
+  scene.widgets = [{ ...createWidget('Metric value'), binding: 'Network download', value: 1_250_000.5 }];
+  assert.deepEqual(parseScene(JSON.stringify(scene)), scene);
+  const preview = withTelemetry(scene, { network_download: 2_500_000 });
+  assert.equal(scene.widgets[0].value, 1_250_000.5);
+  assert.deepEqual(formatMetric('Network download', preview.widgets[0].value), { text: '2.5', unit: 'MB/s' });
+  assert.deepEqual(formatMetric('Network upload', 100_000), { text: '0.1', unit: 'MB/s' });
+  assert.deepEqual(formatMetric('Network upload', 0), { text: '0', unit: 'MB/s' });
+  assert.deepEqual(formatMetric('Network download', 2e9), { text: '2000', unit: 'MB/s' });
+  assert.equal(formatMetric('Network download', null).text, '--');
+  assert.equal(sensors.length, 7);
+  assert.throws(() => parseScene(JSON.stringify({ ...scene, widgets: [{ ...scene.widgets[0], value: -1 }] })));
+  assert.throws(() => parseScene(JSON.stringify({ ...scene, widgets: [{ ...scene.widgets[0], binding: 'CPU load' }] })));
+});
+
+test('font family and styles default gracefully and persist', () => {
+  const scene = emptyScene();
+  const w = createWidget('Text');
+  w.fontFamily = 'orbitron';
+  w.bold = true;
+  w.italic = true;
+  scene.widgets = [w];
+  const roundtrip = parseScene(JSON.stringify(scene));
+  assert.equal(roundtrip.widgets[0].fontFamily, 'orbitron');
+  assert.equal(roundtrip.widgets[0].bold, true);
+  assert.equal(roundtrip.widgets[0].italic, true);
+
+  // Backward compatibility: JSON missing font fields defaults to roboto, false, false
+  const legacyWidget = { ...w };
+  delete (legacyWidget as any).fontFamily;
+  delete (legacyWidget as any).bold;
+  delete (legacyWidget as any).italic;
+  const parsedLegacy = parseScene(JSON.stringify({ ...scene, widgets: [legacyWidget] }));
+  assert.equal(parsedLegacy.widgets[0].fontFamily, 'roboto');
+  assert.equal(parsedLegacy.widgets[0].bold, false);
+  assert.equal(parsedLegacy.widgets[0].italic, false);
+});
+
+test('snap, grid, split, and bend toolbar options persist and default gracefully', () => {
+  const scene = emptyScene();
+  scene.snap = true;
+  scene.grid = false;
+  scene.split = false;
+  scene.bend = false;
+  const roundtrip = parseScene(JSON.stringify(scene));
+  assert.equal(roundtrip.snap, true);
+  assert.equal(roundtrip.grid, false);
+  assert.equal(roundtrip.split, false);
+  assert.equal(roundtrip.bend, false);
+
+  // Backward compatibility: legacy scene without toolbar options defaults gracefully
+  const legacyScene = { ...scene };
+  delete (legacyScene as any).snap;
+  delete (legacyScene as any).grid;
+  delete (legacyScene as any).split;
+  delete (legacyScene as any).bend;
+  const parsedLegacy = parseScene(JSON.stringify(legacyScene));
+  assert.equal(parsedLegacy.snap, false);
+  assert.equal(parsedLegacy.grid, true);
+  assert.equal(parsedLegacy.split, true);
+  assert.equal(parsedLegacy.bend, true);
 });

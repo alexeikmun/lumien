@@ -5,6 +5,7 @@ edition = "2021"
 description = "Minimal CLI controller for TRYX Panorama SE display"
 
 [dependencies]
+lumien-telemetry = { path = "../lumien-telemetry" }
 lumien-protocol = { path = "../lumien-protocol" }
 lumien-device = { path = "../lumien-device" }
 serde = { version = "1.0", features = ["derive"] }

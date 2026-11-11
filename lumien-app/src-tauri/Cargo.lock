@@ -1795,6 +1795,7 @@ version = "0.1.0"
 dependencies = [
  "lumien-device",
  "lumien-protocol",
+ "lumien-telemetry",
  "serde",
  "serde_json",
  "tauri",
@@ -1812,6 +1813,13 @@ dependencies = [
 [[package]]
 name = "lumien-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "lumien-telemetry"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "markup5ever"

@@ -1,4 +1,5 @@
 import type { Scene } from './scene';
+import { sensors } from './metrics.ts';
 
 export type History = { scene: Scene; past: Scene[]; future: Scene[] };
 type Action = { type: 'commit'; scene: Scene; before?: Scene } | { type: 'preview' | 'replace'; scene: Scene } | { type: 'undo' | 'redo' };
@@ -21,11 +22,11 @@ export function historyReducer(state: History, action: Action): History {
 }
 
 // Live readings are preview/apply data; the saved fallback values stay in the document.
-export function withTelemetry(scene: Scene, readings: Record<string, number>): Scene {
-  const keys: Record<string, string> = { 'Memory usage': 'ram', 'CPU load': 'cpu_load', 'CPU temperature': 'cpu_temp', 'GPU load': 'gpu_load', 'GPU temperature': 'gpu_temp' };
+export function withTelemetry(scene: Scene, readings: Record<string, number | null>): Scene {
   return { ...scene, widgets: scene.widgets.map(w => {
-    const value = readings[keys[w.binding]];
-    return w.kind === 'Metric value' && Number.isFinite(value) ? { ...w, value } : w;
+    const key = sensors.find(s => s.binding === w.binding)?.key;
+    const value = key ? readings[key] : null;
+    return w.kind === 'Metric value' && typeof value === 'number' && Number.isFinite(value) ? { ...w, value } : w;
   }) };
 }
 
