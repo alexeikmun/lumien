@@ -23,7 +23,7 @@ if ($LASTEXITCODE -ne 0) { throw "CLI release build failed ($LASTEXITCODE)." }
 New-Item -ItemType Directory -Force -Path "releases\download" | Out-Null
 
 Write-Host "Building NSIS installer..."
-& $makensis "installer.nsi"
+& $makensis "/DVERSION=$version" "installer.nsi"
 if ($LASTEXITCODE -ne 0) { throw "Installer build failed ($LASTEXITCODE)." }
 
 # Copy standalone binaries

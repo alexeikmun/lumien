@@ -392,12 +392,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads %APPDATA%\\kanali and copies its media; run manually on a KANALI host"]
     fn test_scan_live_kanali_if_present() {
         let temp_dir = std::env::temp_dir().join("lumien_kanali_scan_test");
         let _ = fs::remove_dir_all(&temp_dir);
         let list = get_all_presets(&temp_dir);
-        // Expect exactly 26 presets: 4 built-in + 22 imported from Kanali
-        assert_eq!(list.len(), 26);
+        // Built-ins always come first; KANALI imports (if any) follow and depend on the host.
+        assert!(list.len() >= 4);
+        assert!(list[..4].iter().all(|p| p.is_builtin));
         let _ = fs::remove_dir_all(&temp_dir);
     }
 

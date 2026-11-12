@@ -598,15 +598,25 @@ pub fn parse_device_response(frame_bytes: &[u8]) -> Result<DeviceResponse, Proto
                 let (len, new_offset) = decode_varint(payload, offset)?;
                 offset = new_offset;
                 let end = offset + len as usize;
+                if end > payload.len() {
+                    return Err(ProtocolError::BufferTooShort { expected: end, actual: payload.len() });
+                }
                 let mut status = 0u32;
                 let mut s_off = offset;
                 while s_off < end {
                     let (s_tag, next_s) = decode_varint(payload, s_off)?;
                     s_off = next_s;
-                    if (s_tag >> 3) == 1 && (s_tag & 7) == 0 {
-                        let (s_val, next_v) = decode_varint(payload, s_off)?;
-                        status = s_val as u32;
-                        s_off = next_v;
+                    match s_tag & 7 {
+                        0 => {
+                            let (s_val, next_v) = decode_varint(payload, s_off)?;
+                            if (s_tag >> 3) == 1 { status = s_val as u32; }
+                            s_off = next_v;
+                        }
+                        2 => {
+                            let (s_len, next_l) = decode_varint(payload, s_off)?;
+                            s_off = next_l + s_len as usize;
+                        }
+                        _ => return Err(ProtocolError::InvalidResponse),
                     }
                 }
                 if status == 0 {

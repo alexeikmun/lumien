@@ -65,9 +65,10 @@ pub fn prepare(link: &str, cache: &Path, downloader: &Path, ffmpeg: &Path) -> Re
         let size = fs::metadata(&source).map_err(|_| "Download missing or exceeds 128 MB")?.len();
         if size == 0 || size > 128 * 1024 * 1024 { return Err("Downloaded video exceeds 128 MB".into()); }
         let output = dir.join(format!("youtube_{id}.mp4.h264_2240x1080"));
+        // maxrate 3.4 Mbit/s x 300 s + VBV buffer stays under the 128 MiB upload cap.
         let partial = output.with_extension("partial");
         run(Command::new(ffmpeg).args(["-v", "error", "-y", "-i"]).arg(&source)
-            .args(["-map", "0:v:0", "-an", "-vf", "scale=2240:1080:force_original_aspect_ratio=increase,crop=2240:1080,setsar=1", "-r", "30", "-t", "300", "-c:v", "libx264", "-profile:v", "main", "-level:v", "4.1", "-pix_fmt", "yuv420p", "-preset", "fast", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "12M", "-bf", "0", "-g", "1", "-f", "h264"])
+            .args(["-map", "0:v:0", "-an", "-vf", "scale=2240:1080:force_original_aspect_ratio=increase,crop=2240:1080,setsar=1", "-r", "30", "-t", "300", "-c:v", "libx264", "-profile:v", "main", "-level:v", "4.1", "-pix_fmt", "yuv420p", "-preset", "fast", "-b:v", "3M", "-maxrate", "3400k", "-bufsize", "6800k", "-bf", "0", "-g", "1", "-f", "h264"])
             .arg(&partial).stdout(Stdio::null()), &dir, "Converting for LCD")?;
         let size = fs::metadata(&partial).map_err(|e| e.to_string())?.len();
         if size == 0 || size > 128 * 1024 * 1024 { return Err("Converted video exceeds 128 MB".into()); }

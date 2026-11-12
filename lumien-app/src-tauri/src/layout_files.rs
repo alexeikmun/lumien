@@ -25,12 +25,16 @@ fn register(app: &tauri::AppHandle, files: &LayoutFiles, path: &Path) -> Result<
     atomic_write(&catalog, &serde_json::to_string(&paths).map_err(|e| e.to_string())?)
 }
 
-fn read_layout(path: &Path) -> Result<OpenedLayout, String> {
+fn read_validated(path: &Path) -> Result<(OpenedLayout, serde_json::Value), String> {
     let mut content = String::new();
     fs::File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?.take((MAX_BYTES + 1) as u64)
         .read_to_string(&mut content).map_err(|e| format!("Cannot read layout: {e}"))?;
-    validate(content.trim_start_matches('\u{feff}'))?;
-    Ok(OpenedLayout { path: path.to_string_lossy().into_owned(), content })
+    let value = validate(content.trim_start_matches('\u{feff}'))?;
+    Ok((OpenedLayout { path: path.to_string_lossy().into_owned(), content }, value))
+}
+
+fn read_layout(path: &Path) -> Result<OpenedLayout, String> {
+    read_validated(path).map(|(layout, _)| layout)
 }
 
 fn read_recent(config_path: &Path) -> Result<Option<OpenedLayout>, String> {
@@ -78,11 +82,14 @@ pub fn list_layouts(app: tauri::AppHandle, files: tauri::State<'_, LayoutFiles>)
     if let Ok(Some(recent)) = read_recent(&directory.join("recent-layout.json")) {
         paths.insert(PathBuf::from(recent.path));
     }
+    let mut listed = Vec::new();
     let mut layouts: Vec<_> = paths.into_iter().filter_map(|path| {
-        let layout = read_layout(&path).ok()?;
-        let value = validate(layout.content.trim_start_matches('\u{feff}')).ok()?;
+        let (layout, value) = read_validated(&path).ok()?;
+        listed.push(path);
         Some(LayoutOption { path: layout.path, name: value["name"].as_str()?.to_string() })
     }).collect();
+    // Catalog entries come from earlier sessions; register them so load_layout accepts what the picker shows.
+    files.0.lock().map_err(|_| "Layout file lock failed")?.extend(listed);
     layouts.sort_by(|a,b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.path.cmp(&b.path)));
     Ok(layouts)
 }
@@ -105,12 +112,16 @@ fn validate(content: &str) -> Result<serde_json::Value, String> {
         return Err("Unsupported layout document".into());
     }
     if let Some(file) = value.get("bgFile") {
-        let valid = file.as_str().is_some_and(|name| name.len() <= 255
-            && name.ends_with(".mp4.h264_2240x1080")
-            && !name.chars().any(|c| c.is_control() || c == '/' || c == '\\'));
-        if !valid { return Err("Invalid background media file".into()); }
+        if !file.as_str().is_some_and(is_valid_media_name) { return Err("Invalid background media file".into()); }
     }
     Ok(value)
+}
+
+/// Device media file names: bounded, LCD stream suffix, no path separators or control characters.
+pub fn is_valid_media_name(name: &str) -> bool {
+    name.len() <= 255
+        && name.ends_with(".mp4.h264_2240x1080")
+        && !name.chars().any(|c| c.is_control() || c == '/' || c == '\\')
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {

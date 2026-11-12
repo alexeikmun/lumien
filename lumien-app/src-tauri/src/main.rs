@@ -505,10 +505,39 @@ async fn play_youtube(app: tauri::AppHandle, url: String) -> Result<String, Stri
     }).await.map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
+/// Sends WorkConfigPb for an already-uploaded media file and waits for the device ACK.
+fn activate_media(dev: &mut DisplaySession, file_name: &str) -> Result<(), String> {
+    let frame = lumien_protocol::encode_work_config_frame(file_name);
+    let t0 = std::time::Instant::now();
+    dev.write_frame(&frame, Duration::from_millis(2000)).map_err(|e| {
+        log_usb("ERROR", &format!("Bulk OUT work_config frame failed: {:?}", e));
+        format!("Write failed: {:?}", e)
+    })?;
+    let payload = dev.read_frame(Duration::from_millis(2000)).map_err(|e| {
+        log_usb("ERROR", &format!("Bulk IN WorkConfig ACK failed: {:?}", e));
+        format!("Read failed: {:?}", e)
+    })?;
+    log_usb("READ", &format!("WorkConfig ACK ({} bytes) in {:?} | Hex: {}", payload.len(), t0.elapsed(),
+        hex_preview(&payload[..std::cmp::min(16, payload.len())])));
+    let ack = parse_response_frame(&lumien_protocol::encode_frame(&payload)).map_err(|e| format!("Invalid ACK: {:?}", e))?;
+    if !ack.ok {
+        log_usb("WARN", "Device rejected work config command.");
+        return Err("Device rejected work config command.".to_string());
+    }
+    Ok(())
+}
+
+fn open_session(command: &str) -> Result<DisplaySession, String> {
+    DisplaySession::open_first().map_err(|e| {
+        log_usb("ERROR", &format!("open_first failed during {command}: {:?}", e));
+        format!("Failed to open device: {:?}", e)
+    })
+}
+
+// async: keep USB transfers (and FFmpeg encodes) off the main/UI thread.
+#[tauri::command(async)]
 fn set_display_background(app: tauri::AppHandle, file_name: String) -> Result<String, String> {
-    if file_name.len() > 255 || !file_name.ends_with(".mp4.h264_2240x1080")
-        || file_name.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+    if !layout_files::is_valid_media_name(&file_name) {
         return Err("Invalid background media file".into());
     }
     ensure_usb_channel_available()?;
@@ -517,55 +546,16 @@ fn set_display_background(app: tauri::AppHandle, file_name: String) -> Result<St
     let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
     drop(worker.take());
 
-    let frame = lumien_protocol::encode_work_config_frame(&file_name);
-    let mut dev = match DisplaySession::open_first() {
-        Ok(d) => {
-            log_usb("INFO", "Device opened for set_display_background.");
-            d
-        }
-        Err(e) => {
-            log_usb("ERROR", &format!("open_first failed during set_display_background: {:?}", e));
-            return Err(format!("Failed to open device: {:?}", e));
-        }
-    };
-
-    let t0 = std::time::Instant::now();
-    if let Err(e) = dev.write_frame(&frame, Duration::from_millis(2000)) {
-        log_usb("ERROR", &format!("Bulk OUT work_config frame failed: {:?}", e));
-        return Err(format!("Write failed: {:?}", e));
+    let mut dev = open_session("set_display_background")?;
+    activate_media(&mut dev, &file_name)?;
+    log_usb("INFO", "Background media switched successfully.");
+    if let Ok(config_dir) = app.path().app_config_dir() {
+        let _ = presets::save_active_preset(&config_dir, &file_name);
     }
-    log_usb("WRITE", &format!("WorkConfig frame ({} bytes) in {:?}", frame.len(), t0.elapsed()));
-
-    let t1 = std::time::Instant::now();
-    let payload = match dev.read_frame(Duration::from_millis(2000)) {
-        Ok(p) => {
-            let prev = hex_preview(&p[..std::cmp::min(16, p.len())]);
-            log_usb("READ", &format!("WorkConfig ACK ({} bytes) in {:?} | Hex: {}", p.len(), t1.elapsed(), prev));
-            p
-        }
-        Err(e) => {
-            log_usb("ERROR", &format!("Bulk IN WorkConfig ACK failed: {:?}", e));
-            return Err(format!("Read failed: {:?}", e));
-        }
-    };
-
-    let total = lumien_protocol::encode_frame(&payload);
-    let ack = parse_response_frame(&total)
-        .map_err(|e| format!("Invalid ACK: {:?}", e))?;
-
-    if ack.ok {
-        log_usb("INFO", "Background media switched successfully.");
-        if let Ok(config_dir) = app.path().app_config_dir() {
-            let _ = presets::save_active_preset(&config_dir, &file_name);
-        }
-        Ok(format!("Background set to {}", file_name))
-    } else {
-        log_usb("WARN", "Device rejected work config command.");
-        Err("Device rejected work config command.".to_string())
-    }
+    Ok(format!("Background set to {}", file_name))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_solid_color_background(app: tauri::AppHandle, color: String) -> Result<String, String> {
     ensure_usb_channel_available()?;
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
@@ -576,16 +566,7 @@ fn set_solid_color_background(app: tauri::AppHandle, color: String) -> Result<St
     let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
     drop(worker.take());
 
-    let mut dev = match DisplaySession::open_first() {
-        Ok(d) => {
-            log_usb("INFO", "Device opened for set_solid_color_background.");
-            d
-        }
-        Err(e) => {
-            log_usb("ERROR", &format!("open_first failed during set_solid_color_background: {:?}", e));
-            return Err(format!("Failed to open device: {:?}", e));
-        }
-    };
+    let mut dev = open_session("set_solid_color_background")?;
 
     // 1. Transmit file to device eMMC
     let t0 = std::time::Instant::now();
@@ -597,27 +578,10 @@ fn set_solid_color_background(app: tauri::AppHandle, color: String) -> Result<St
     log_usb("WRITE", &format!("Transmitted {} ({} bytes) in {:?}", file_name, data.len(), t0.elapsed()));
 
     // 2. Activate playback context via WorkConfigPb
-    let frame = lumien_protocol::encode_work_config_frame(&file_name);
-    let t1 = std::time::Instant::now();
-    dev.write_frame(&frame, Duration::from_millis(2000))
-        .map_err(|e| format!("Activate work_config failed: {:?}", e))?;
-
-    let payload = dev.read_frame(Duration::from_millis(2000))
-        .map_err(|e| format!("Read work_config ACK failed: {:?}", e))?;
-    log_usb("WRITE", &format!("WorkConfig frame in {:?}", t1.elapsed()));
-
-    let total = lumien_protocol::encode_frame(&payload);
-    let ack = parse_response_frame(&total)
-        .map_err(|e| format!("Invalid ACK: {:?}", e))?;
-
-    if ack.ok {
-        log_usb("INFO", &format!("Solid color background ({}) activated successfully.", color));
-        let _ = presets::save_active_preset(&config_dir, &file_name);
-        Ok(format!("Solid background ({}) activated on display.", color))
-    } else {
-        log_usb("WARN", "Device rejected work config command.");
-        Err("Device rejected work config command.".to_string())
-    }
+    activate_media(&mut dev, &file_name)?;
+    log_usb("INFO", &format!("Solid color background ({}) activated successfully.", color));
+    let _ = presets::save_active_preset(&config_dir, &file_name);
+    Ok(format!("Solid background ({}) activated on display.", color))
 }
 
 #[tauri::command]

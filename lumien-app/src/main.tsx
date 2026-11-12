@@ -161,6 +161,7 @@ function App() {
   }, [desktop]);
 
   const renameStart = useRef<Scene | null>(null);
+  const colorStart = useRef<Scene | null>(null);
   const discardDialog = useRef<HTMLDialogElement>(null);
   const fileOperation = useRef(false);
   const startupApply = useRef<Scene | null>(null);
@@ -287,12 +288,19 @@ function App() {
     }
   };
 
+  // The native color input fires on every drag tick: preview while picking, commit one undo step on blur.
   const onColorPickerChange = (color: string) => {
     const norm = normalizeHex(color);
     setSolidColor(norm);
     setHexInput(norm.toUpperCase());
     localStorage.setItem('lumien_solid_color', norm);
-    commit({ ...scene, bgType: 'solid', bgColor: norm, bgFile: undefined });
+    colorStart.current ??= scene;
+    dispatch({ type: 'preview', scene: { ...scene, bgType: 'solid', bgColor: norm, bgFile: undefined } });
+  };
+
+  const onColorPickerDone = () => {
+    if (colorStart.current) dispatch({ type: 'commit', scene, before: colorStart.current });
+    colorStart.current = null;
   };
 
   const onHexInputChange = (raw: string) => {
@@ -990,7 +998,9 @@ function App() {
                         aria-label="Choose background color"
                         className="color-picker-input"
                         value={solidColor}
+                        onFocus={() => { colorStart.current = scene; }}
                         onChange={(e) => onColorPickerChange(e.target.value)}
+                        onBlur={onColorPickerDone}
                         title="Open color picker"
                       />
                       </label>

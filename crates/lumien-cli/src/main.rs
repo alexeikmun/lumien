@@ -176,13 +176,18 @@ fn build_metric_group(gid: u32, x: u32, y: u32, width: u32, height: u32, title: 
     }
 }
 
-fn send_usb_frame(frame: &[u8], desc: &str) {
+/// Exits when UDB.exe is running, to prevent USB packet interleaving with KANALI.
+fn require_quiet_usb() {
     let udb_pids = check_process("UDB.exe");
     if !udb_pids.is_empty() {
         eprintln!("[PRE-FLIGHT BLOCKER] UDB.exe (PID(s): {:?}) is running.", udb_pids);
         eprintln!("Please close KANALI before testing to prevent USB packet interleaving.");
         std::process::exit(2);
     }
+}
+
+fn send_usb_frame(frame: &[u8], desc: &str) {
+    require_quiet_usb();
 
     let t_start = Instant::now();
     println!("[{:?}] Connecting to TRYX Panorama SE (VID 0x391A, PID 0x1021)...", t_start.elapsed());
@@ -253,6 +258,7 @@ fn main() {
     match args[1].as_str() {
         "play-video" => {
             if args.len() != 3 { eprintln!("Usage: lumien-cli play-video PREPARED_H264_FILE"); std::process::exit(1); }
+            require_quiet_usb();
             match youtube::play(std::path::Path::new(&args[2])) {
                 Ok(name) => println!("Playback and clear-overlay ACKs received: {name}"),
                 Err(error) => { eprintln!("{error}"); std::process::exit(1); }
@@ -389,6 +395,10 @@ fn main() {
             }
             let raw_color = &args[2];
             let clean = raw_color.trim_start_matches('#').to_ascii_lowercase();
+            if clean.len() != 6 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+                eprintln!("Error: expected six-digit hex color (e.g. #18262e).");
+                std::process::exit(1);
+            }
             let filename = format!("solid_{}.mp4.h264_2240x1080", clean);
             println!("=== Lumien Set Solid Color Background: #{} ===", clean);
 
@@ -408,6 +418,7 @@ fn main() {
                 }
             };
 
+            require_quiet_usb();
             let mut dev = match PanoramaDevice::open_first() {
                 Ok(d) => d,
                 Err(e) => {
