@@ -11,6 +11,7 @@ export interface DeviceAdapter {
   applyScene(scene: Scene): Promise<string>;
   clearDisplay(): Promise<string>;
   getTelemetry(): Promise<Record<string, number | null>>;
+  getCpuTemperatureStatus(): Promise<string | null>;
 }
 
 export class RealDeviceAdapter implements DeviceAdapter {
@@ -49,6 +50,13 @@ export class RealDeviceAdapter implements DeviceAdapter {
       return {};
     }
     return await invoke<Record<string, number | null>>('get_telemetry');
+  }
+
+  async getCpuTemperatureStatus(): Promise<string | null> {
+    if (!this.isTauri()) {
+      return null;
+    }
+    return await invoke<string | null>('get_cpu_temperature_status');
   }
 }
 

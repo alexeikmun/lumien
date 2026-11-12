@@ -383,6 +383,11 @@ fn get_telemetry() -> Result<HashMap<String, Option<f64>>, String> {
 }
 
 #[tauri::command]
+fn get_cpu_temperature_status() -> Option<String> {
+    cpu_temperature::status()
+}
+
+#[tauri::command(async)]
 fn clear_display() -> Result<String, String> {
     ensure_usb_channel_available()?;
     log_usb("INFO", "Executing clear_display command...");
@@ -584,8 +589,9 @@ fn set_solid_color_background(app: tauri::AppHandle, color: String) -> Result<St
     Ok(format!("Solid background ({}) activated on display.", color))
 }
 
-#[tauri::command]
-fn apply_scene(scene_json: String) -> Result<String, String> {
+// async: stopping a worker mid-restore and the USB transaction must not freeze the UI thread.
+#[tauri::command(async)]
+fn apply_scene(app: tauri::AppHandle, scene_json: String) -> Result<String, String> {
     ensure_usb_channel_available()?;
 
     let scene: LayoutScene = serde_json::from_str(&scene_json)
@@ -708,131 +714,192 @@ fn apply_scene(scene_json: String) -> Result<String, String> {
 
     let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
     drop(worker.take());
-    let mut dev = match DisplaySession::open_first() {
-        Ok(d) => {
-            log_usb("INFO", "Device opened for apply_scene.");
-            d
-        }
-        Err(e) => {
-            log_usb("ERROR", &format!("Failed to open device: {:?}", e));
-            return Err(format!("Failed to open device (ensure display is connected): {:?}", e));
-        }
-    };
 
-    let t0 = std::time::Instant::now();
-    if let Err(e) = dev.write_frame(&frame, Duration::from_millis(2000)) {
-        log_usb("ERROR", &format!("Bulk OUT RunConfig failed: {:?}", e));
-        return Err(format!("Write failed: {:?}", e));
-    }
-    log_usb("WRITE", &format!("RunConfig ({} bytes) in {:?}", frame.len(), t0.elapsed()));
-
-    let t1 = std::time::Instant::now();
-    let payload = match dev.read_frame(Duration::from_millis(2000)) {
-        Ok(p) => {
-            let prev = hex_preview(&p[..std::cmp::min(16, p.len())]);
-            log_usb("READ", &format!("RunConfig ACK ({} bytes) in {:?} | Hex: {}", p.len(), t1.elapsed(), prev));
-            p
-        }
-        Err(e) => {
-            log_usb("ERROR", &format!("Bulk IN RunConfig ACK failed: {:?}", e));
-            return Err(format!("Read failed: {:?}", e));
+    // A transport failure (display still booting, asleep, or unplugged) is not final: the worker keeps the
+    // layout and applies it as soon as the display answers. Only an explicit device rejection is returned.
+    let restore = Restore { frame, config_dir: app.path().app_config_dir().ok() };
+    let (dev, message) = match open_session("apply_scene").map_err(Transfer::Failed).and_then(|mut dev| send_run_config(&mut dev, &restore.frame).map(|_| dev)) {
+        Ok(dev) => (Some(dev), format!("Layout active on display with live 1 Hz updates ({} widgets).", groups.len())),
+        Err(Transfer::Rejected(e)) => return Err(e),
+        Err(Transfer::Failed(e)) => {
+            log_usb("WARN", &format!("Display not ready ({e}); layout queued for automatic apply."));
+            (None, "Display is not responding yet. Lumien will apply this layout automatically as soon as it is ready.".to_string())
         }
     };
 
-    let total_frame = lumien_protocol::encode_frame(&payload);
-    let ack = parse_response_frame(&total_frame)
-        .map_err(|e| format!("Invalid response frame: {:?}", e))?;
-
-    if !ack.ok {
-        log_usb("WARN", "Device rejected layout frame.");
-        return Err("Device rejected layout frame.".to_string());
-    }
-
-    // Transfer the acknowledged layout's handle to exactly one worker.
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
-    let thread = std::thread::spawn(move || {
-        log_usb("INFO", "Background 1 Hz telemetry loop started (not a verified firmware keepalive).");
-        {
-            log_usb("INFO", "Telemetry worker owns acknowledged layout handle.");
-            while !worker_stop.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1000));
-                if worker_stop.load(Ordering::SeqCst) {
-                    break;
+    let thread = std::thread::spawn(move || run_sync_worker(&worker_stop, dev, &restore, &bindings));
+    *worker = Some(SyncWorker { stop, thread: Some(thread) });
+    Ok(message)
+}
+
+enum Transfer { Failed(String), Rejected(String) }
+
+/// Sends a RunConfig layout frame and waits for its ACK.
+fn send_run_config(dev: &mut DisplaySession, frame: &[u8]) -> Result<(), Transfer> {
+    let t0 = std::time::Instant::now();
+    dev.write_frame(frame, Duration::from_millis(2000)).map_err(|e| {
+        log_usb("ERROR", &format!("Bulk OUT RunConfig failed: {:?}", e));
+        Transfer::Failed(format!("Write failed: {:?}", e))
+    })?;
+    let payload = dev.read_frame(Duration::from_millis(2000)).map_err(|e| {
+        log_usb("ERROR", &format!("Bulk IN RunConfig ACK failed: {:?}", e));
+        Transfer::Failed(format!("Read failed: {:?}", e))
+    })?;
+    log_usb("READ", &format!("RunConfig ({} bytes) ACK ({} bytes) in {:?} | Hex: {}", frame.len(), payload.len(), t0.elapsed(),
+        hex_preview(&payload[..std::cmp::min(16, payload.len())])));
+    let ack = parse_response_frame(&lumien_protocol::encode_frame(&payload))
+        .map_err(|e| Transfer::Failed(format!("Invalid response frame: {:?}", e)))?;
+    if !ack.ok {
+        log_usb("WARN", "Device rejected layout frame.");
+        return Err(Transfer::Rejected("Device rejected layout frame.".to_string()));
+    }
+    Ok(())
+}
+
+/// What the display must show again after it resets: the acknowledged layout and the saved background.
+struct Restore {
+    frame: Vec<u8>,
+    config_dir: Option<std::path::PathBuf>,
+}
+
+/// Reopens the display and re-sends the active background media, then the layout.
+fn restore_display(restore: &Restore) -> Result<DisplaySession, String> {
+    ensure_usb_channel_available()?;
+    let mut dev = open_session("restore_display")?;
+    if let Some(media) = restore.config_dir.as_deref().map(presets::load_active_preset).filter(|m| layout_files::is_valid_media_name(m)) {
+        // The layout matters more than the background; a missing media file must not block it.
+        if let Err(e) = activate_media(&mut dev, &media) {
+            log_usb("WARN", &format!("Restore: background {media} not re-activated: {e}"));
+        }
+    }
+    match send_run_config(&mut dev, &restore.frame) {
+        Ok(()) => Ok(dev),
+        Err(Transfer::Failed(e) | Transfer::Rejected(e)) => Err(e),
+    }
+}
+
+/// Incremented by the OS power callback on every resume from sleep or hibernation.
+static RESUMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sleeps in short steps so stop requests (new Apply, Clear, exit) are honoured quickly. False when stopped.
+fn wait_unless_stopped(stop: &AtomicBool, total: Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if stop.load(Ordering::SeqCst) { return false; }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !stop.load(Ordering::SeqCst)
+}
+
+/// Owns the display handle for an applied layout: pushes 1 Hz telemetry, and when the display stops
+/// answering or the PC resumes from sleep, reconnects and restores background + layout with backoff.
+fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: &Restore, bindings: &[ActiveBinding]) {
+    const MAX_BACKOFF: Duration = Duration::from_secs(10);
+    log_usb("INFO", "Layout worker started (1 Hz telemetry, automatic display recovery).");
+    let mut seen_resumes = RESUMES.load(Ordering::SeqCst);
+    let mut backoff = Duration::from_secs(1);
+    let mut failures = 0u32;
+    loop {
+        if dev.is_none() {
+            if !wait_unless_stopped(stop, backoff) { break; }
+            seen_resumes = RESUMES.load(Ordering::SeqCst);
+            match restore_display(restore) {
+                Ok(d) => {
+                    log_usb("INFO", &format!("Display restored after {failures} failed attempt(s)."));
+                    dev = Some(d);
+                    failures = 0;
+                    backoff = Duration::from_secs(1);
                 }
-
-                let cpu = read_cpu_load();
-                let ram = read_ram_load();
-                let (gpu_temp, gpu_load) = read_gpu_telemetry();
-                let network = read_network_rates();
-
-                if bindings.is_empty() {
-                    continue;
-                }
-
-                let mut updates = Vec::new();
-                for b in &bindings {
-                    let value = match b.sensor.as_str() {
-                        "CPU load" => Some(cpu as f64),
-                        "CPU temperature" => cpu_temperature::read(),
-                        "GPU load" => Some(gpu_load as f64),
-                        "GPU temperature" => Some(gpu_temp as f64),
-                        "Memory usage" => Some(ram as f64),
-                        "Network download" => network.map(|r| r.download),
-                        "Network upload" => network.map(|r| r.upload),
-                        _ => Some(cpu as f64),
-                    };
-                    updates.push(binding_update(b, value));
-                }
-
-                if let Ok(update_frame) = encode_batch_label_update_frame(&updates) {
-                    let t_w = std::time::Instant::now();
-                    let write_res = dev.write_frame(&update_frame, Duration::from_millis(500));
-                    let dt_w = t_w.elapsed();
-
-                    match write_res {
-                        Ok(_) => {
-                            let t_r = std::time::Instant::now();
-                            let read_res = dev.read_frame(Duration::from_millis(500));
-                            let dt_r = t_r.elapsed();
-
-                            match read_res {
-                                Ok(p) => {
-                                    match parse_response_frame(&lumien_protocol::encode_frame(&p)) {
-                                        Ok(ack) if ack.ok => {}
-                                        other => {
-                                            log_usb("ERROR", &format!("Telemetry ACK rejected/invalid: {:?}; stopping without retry.", other));
-                                            break;
-                                        }
-                                    }
-                                    log_usb(
-                                        "SYNC",
-                                        &format!(
-                                            "Tick OK: Out {}B ({:?}), In {}B ({:?}) [CPU: {}%, GPU: {}°C/{}%, RAM: {}%]",
-                                            update_frame.len(), dt_w, p.len(), dt_r, cpu, gpu_temp, gpu_load, ram
-                                        ),
-                                    );
-                                }
-                                Err(e) => {
-                                    log_usb("ERROR", &format!("Tick ACK read failed after {:?}: {:?}; stopping without retry.", dt_r, e));
-                                    break;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log_usb("ERROR", &format!("Tick Bulk OUT write failed after {:?}: {:?}; stopping without retry.", dt_w, e));
-                            break;
-                        }
-                    }
-
+                Err(e) => {
+                    failures += 1;
+                    if failures == 1 || failures % 30 == 0 { log_usb("WARN", &format!("Display restore attempt {failures} failed: {e}")); }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
+            continue;
         }
-        log_usb("INFO", "Background telemetry loop stopped.");
-    });
-    *worker = Some(SyncWorker { stop, thread: Some(thread) });
 
-    Ok(format!("Layout active on display with live 1 Hz updates ({} widgets).", groups.len()))
+        if !wait_unless_stopped(stop, Duration::from_secs(1)) { break; }
+
+        // After sleep the display may have reset (blank screen) even if the old handle still answers.
+        let resumes = RESUMES.load(Ordering::SeqCst);
+        if resumes != seen_resumes {
+            log_usb("INFO", "System resumed from sleep; restoring display.");
+            dev = None;
+            backoff = Duration::from_secs(3); // let USB re-enumerate before reopening
+            continue;
+        }
+        if bindings.is_empty() { continue; }
+
+        let cpu = read_cpu_load();
+        let ram = read_ram_load();
+        let (gpu_temp, gpu_load) = read_gpu_telemetry();
+        let network = read_network_rates();
+        let updates: Vec<_> = bindings.iter().map(|b| {
+            let value = match b.sensor.as_str() {
+                "CPU load" => Some(cpu as f64),
+                "CPU temperature" => cpu_temperature::read(),
+                "GPU load" => Some(gpu_load as f64),
+                "GPU temperature" => Some(gpu_temp as f64),
+                "Memory usage" => Some(ram as f64),
+                "Network download" => network.map(|r| r.download),
+                "Network upload" => network.map(|r| r.upload),
+                _ => Some(cpu as f64),
+            };
+            binding_update(b, value)
+        }).collect();
+        let Ok(update_frame) = encode_batch_label_update_frame(&updates) else { continue };
+
+        let session = dev.as_mut().expect("checked above");
+        let result = session.write_frame(&update_frame, Duration::from_millis(500))
+            .map_err(|e| format!("write: {:?}", e))
+            .and_then(|_| session.read_frame(Duration::from_millis(500)).map_err(|e| format!("ACK read: {:?}", e)))
+            .and_then(|p| match parse_response_frame(&lumien_protocol::encode_frame(&p)) {
+                Ok(ack) if ack.ok => Ok(p.len()),
+                other => Err(format!("ACK rejected/invalid: {:?}", other)),
+            });
+        match result {
+            Ok(n) => log_usb("SYNC", &format!("Tick OK: Out {}B, In {}B [CPU: {}%, GPU: {}°C/{}%, RAM: {}%]", update_frame.len(), n, cpu, gpu_temp, gpu_load, ram)),
+            Err(e) => {
+                // A rejected update usually means the display lost the layout (reset); restore it.
+                log_usb("WARN", &format!("Telemetry tick failed ({e}); reconnecting and restoring the display."));
+                dev = None;
+                backoff = Duration::from_secs(1);
+            }
+        }
+    }
+    log_usb("INFO", "Layout worker stopped.");
+}
+
+#[repr(C)]
+struct DeviceNotifySubscribeParameters {
+    callback: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> u32,
+    context: *mut c_void,
+}
+
+#[link(name = "powrprof")]
+extern "system" {
+    fn PowerRegisterSuspendResumeNotification(flags: u32, recipient: *const c_void, handle: *mut *mut c_void) -> u32;
+}
+
+unsafe extern "system" fn on_power_event(_context: *mut c_void, kind: u32, _setting: *mut c_void) -> u32 {
+    const PBT_APMRESUMESUSPEND: u32 = 0x7;
+    const PBT_APMRESUMEAUTOMATIC: u32 = 0x12;
+    if kind == PBT_APMRESUMEAUTOMATIC || kind == PBT_APMRESUMESUSPEND {
+        RESUMES.fetch_add(1, Ordering::SeqCst);
+    }
+    0
+}
+
+/// Subscribes to suspend/resume notifications for the life of the process (no window needed).
+fn watch_power_resume() {
+    const DEVICE_NOTIFY_CALLBACK: u32 = 2;
+    let params = Box::leak(Box::new(DeviceNotifySubscribeParameters { callback: on_power_event, context: std::ptr::null_mut() }));
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe { PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, params as *const _ as *const c_void, &mut handle) };
+    if status != 0 { log_usb("WARN", &format!("Sleep/wake notifications unavailable (error {status}); display recovery relies on USB errors only.")); }
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -849,18 +916,90 @@ fn is_autostart_launch(args: impl IntoIterator<Item = String>) -> bool {
     })
 }
 
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const AUTOSTART_TASK: &str = "Lumien";
+
+#[cfg_attr(debug_assertions, allow(dead_code))]
+#[link(name = "shell32")]
+extern "system" {
+    fn IsUserAnAdmin() -> i32;
+}
+
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn hidden(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = std::process::Command::new(program);
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    command
+}
+
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Task Scheduler XML for an at-sign-in launch with the user's highest privileges. A Run key launch is
+/// never elevated, and LibreHardwareMonitor needs administrator rights for CPU temperature sensors.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn autostart_task_xml(exe: &std::path::Path, user: &str) -> String {
+    format!(r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Starts Lumien at sign-in with access to CPU temperature sensors.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>--autostart</Arguments></Exec></Actions>
+</Task>"#, user = xml_escape(user), exe = xml_escape(&exe.display().to_string()))
+}
+
+/// Registers (or refreshes) the elevated sign-in task. Requires an elevated process.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn register_autostart_task(exe: &std::path::Path) -> Result<(), String> {
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) => format!("{domain}\\{name}"),
+        _ => return Err("Cannot determine the signed-in user".into()),
+    };
+    // schtasks expects the XML file in UTF-16 with a byte-order mark.
+    let bytes: Vec<u8> = std::iter::once(0xFEFFu16).chain(autostart_task_xml(exe, &user).encode_utf16()).flat_map(u16::to_le_bytes).collect();
+    let path = std::env::temp_dir().join(format!("lumien-autostart-{}.xml", std::process::id()));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let status = hidden("schtasks").args(["/Create", "/F", "/TN", AUTOSTART_TASK, "/XML"]).arg(&path).status();
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("schtasks exited with {s}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn ensure_autostart_registered() {
     // Only register release / production builds to autostart, never debug development builds
     #[cfg(not(debug_assertions))]
     {
-        if let Ok(exe) = std::env::current_exe() {
-            use std::os::windows::process::CommandExt;
-            let val = format!("\"{}\" --autostart", exe.display());
-            let _ = std::process::Command::new("reg")
-                .args(["add", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "Lumien", "/t", "REG_SZ", "/d", &val, "/f"])
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                .status();
+        const RUN_KEY: &str = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        let Ok(exe) = std::env::current_exe() else { return };
+        // Elevated: switch to the elevated sign-in task and drop the Run entry so only one instance starts.
+        if unsafe { IsUserAnAdmin() } != 0 {
+            match register_autostart_task(&exe) {
+                Ok(()) => {
+                    let _ = hidden("reg").args(["delete", RUN_KEY, "/v", "Lumien", "/f"]).status();
+                    return;
+                }
+                Err(e) => log_usb("WARN", &format!("Elevated autostart task not registered: {e}")),
+            }
         }
+        // Not elevated: keep an existing elevated task; otherwise fall back to the (unelevated) Run entry.
+        if hidden("schtasks").args(["/Query", "/TN", AUTOSTART_TASK]).output().is_ok_and(|o| o.status.success()) {
+            return;
+        }
+        let val = format!("\"{}\" --autostart", exe.display());
+        let _ = hidden("reg").args(["add", RUN_KEY, "/v", "Lumien", "/t", "REG_SZ", "/d", &val, "/f"]).status();
     }
     #[cfg(debug_assertions)]
     {
@@ -942,6 +1081,10 @@ fn main() {
         .setup(|app| {
             setup_tray(app)?;
             ensure_autostart_registered();
+            watch_power_resume();
+            // Start the CPU temperature helper now: LibreHardwareMonitor takes seconds to open its sensors,
+            // so the startup layout apply would otherwise always begin with an empty reading.
+            let _ = cpu_temperature::read();
             if !is_autostart_launch(std::env::args()) {
                 show_main_window(&app.handle());
             }
@@ -961,6 +1104,7 @@ fn main() {
             layout_files::remember_layout,
             get_device_status,
             get_telemetry,
+            get_cpu_temperature_status,
             apply_scene,
             clear_display,
             list_presets,

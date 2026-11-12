@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useReducer } from 'react';
+import { useRef, useState, useEffect, useReducer, type CSSProperties } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   sample,
@@ -19,43 +19,70 @@ import { device } from './adapter';
 import { invoke } from '@tauri-apps/api/core';
 import { historyReducer, initialHistory, withTelemetry, takeStartupScene } from './editor';
 import { sensors, isNetwork, metricMax, formatMetric } from './metrics';
+import { Icon, sensorIcon } from './icons';
 import './style.css';
 
-function Preview({ w, readings }: { w: Widget; readings: Record<string, number | null> }) {
-  const key = sensors.find(s => s.binding === w.binding)?.key;
-  const available = !isNetwork(w.binding) || (key && readings[key] != null);
-  const value = w.binding === 'CPU temperature' ? readings.cpu_temp : available ? w.value : null;
-  const metric = formatMetric(w.binding, value);
-  const fontFam = getCssFontFamily(w.fontFamily);
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+function fontStyleOf(w: Widget) {
   const fam = (w.fontFamily || 'roboto').toLowerCase();
   const isRoboto = fam === 'roboto' || fam === 'roboto-black';
-  const isBlack = fam === 'roboto-black';
-  const fontStyle = isRoboto && w.italic ? 'italic' : 'normal';
-  const fontWeight = isBlack ? 900 : isRoboto && w.bold ? 700 : 400;
+  return {
+    fontFamily: getCssFontFamily(w.fontFamily),
+    fontWeight: fam === 'roboto-black' ? 900 : isRoboto && w.bold ? 700 : 400,
+    fontStyle: isRoboto && w.italic ? 'italic' : 'normal',
+  } as const;
+}
 
+// Mirrors apply_scene's LabelGroup: value + unit on the primary row, title on the subtitle row,
+// one text color, no widget background, and the same size multipliers/clamps the LCD uses.
+function Preview({ w, readings, cpuTempStatus }: { w: Widget; readings: Record<string, number | null>; cpuTempStatus: string | null }) {
+  const font = fontStyleOf(w);
+  if (w.kind === 'Text') {
+    return <div className="widget text" style={{ ...font, color: w.color, fontSize: w.fontSize }}>{w.text}</div>;
+  }
+  const key = sensors.find(s => s.binding === w.binding)?.key;
+  const available = !isNetwork(w.binding) || (key && readings[key] != null);
+  const isCpuTemp = w.binding === 'CPU temperature';
+  const value = isCpuTemp ? readings.cpu_temp : available ? w.value : null;
+  const metric = formatMetric(w.binding, value);
+  const valueSize = clamp(Math.round(w.fontSize * 1.65), 16, 220);
   return (
-    <div
-      className="widget"
-      style={{
-        background: w.background,
-        color: w.color,
-        fontSize: w.fontSize,
-        fontFamily: fontFam,
-        fontStyle,
-      }}
-    >
-      {w.kind === 'Text' ? (
-        <div style={{ fontWeight }}>{w.text}</div>
-      ) : (
-        <>
-          <small style={{ fontWeight }}>{w.text}</small>
-          <strong style={{ fontWeight }}>
-            {metric.text}
-            <em style={{ fontStyle: isRoboto && w.italic ? 'italic' : 'normal' }}>{metric.unit}</em>
-          </strong>
-        </>
-      )}
+    <div className="widget" style={{ ...font, color: w.color }} title={isCpuTemp && value == null ? cpuTempStatus ?? undefined : undefined}>
+      <div className="metric-row">
+        <span style={{ fontSize: valueSize }}>{metric.text}</span>
+        <span style={{ fontSize: clamp(Math.round(valueSize * 0.65), 12, 140) }}>{metric.unit}</span>
+      </div>
+      <div className="metric-title" style={{ fontSize: clamp(Math.round(w.fontSize * 0.45), 14, 60) }}>{w.text}</div>
     </div>
+  );
+}
+
+// Typing stays local until blur/Enter so clamping never fights the keyboard; valid values preview live.
+function NumberField({ label, value, min, max, step, disabled, onBegin, onPreview, onCommit }: {
+  label: string; value: number; min: number; max: number; step?: number | 'any'; disabled?: boolean;
+  onBegin: () => void; onPreview: (v: number) => void; onCommit: (v?: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const finish = () => {
+    if (draft === null) return onCommit();
+    const n = Number(draft);
+    setDraft(null);
+    onCommit(draft.trim() !== '' && Number.isFinite(n) ? clamp(n, min, max) : undefined);
+  };
+  return (
+    <label className="field">
+      {label}
+      <input type="number" value={draft ?? String(value)} min={min} max={max} step={step ?? 1} disabled={disabled}
+        onFocus={onBegin}
+        onChange={e => {
+          setDraft(e.target.value);
+          const n = e.target.valueAsNumber;
+          if (Number.isFinite(n) && n >= min && n <= max) onPreview(n);
+        }}
+        onBlur={finish}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') e.currentTarget.blur(); }} />
+    </label>
   );
 }
 
@@ -98,8 +125,23 @@ function normalizeHex(hex: string): string {
   return '#000000';
 }
 
+function toneOf(status: string): 'ok' | 'error' | 'busy' | 'info' {
+  if (/…|\.\.\.$/.test(status)) return 'busy';
+  if (/fail|error|could not|cannot|invalid|unsupported|not supported|cancelled|unavailable|limit/i.test(status)) return 'error';
+  if (/applied|saved|activated|imported|removed|opened|ready|cleared|reopened|success/i.test(status)) return 'ok';
+  return 'info';
+}
+
+const load = (key: string) => { try { return localStorage.getItem(key); } catch { return null; } };
+const readStored = <T extends string>(key: string, allowed: readonly T[], fallback: T): T => {
+  const v = load(key) as T | null;
+  return v && allowed.includes(v) ? v : fallback;
+};
+const store = (key: string, value: string) => { try { localStorage.setItem(key, value); } catch { /* storage unavailable */ } };
+
 type DownloadedVideo = { id: string; title: string; duration: number; bytes: number; thumbnail: string };
 type LayoutOption = { path: string; name: string };
+type BgTab = 'presets' | 'solid' | 'video';
 
 function App() {
   const desktop = '__TAURI_INTERNALS__' in window;
@@ -118,22 +160,18 @@ function App() {
     [starting, setStarting] = useState(desktop),
     [fileError, setFileError] = useState<string | null>(null),
     [readings, setReadings] = useState<Record<string, number | null>>({}),
+    [cpuTempStatus, setCpuTempStatus] = useState<string | null>(null),
     [pending, setPending] = useState<'new' | { scene: Scene; path: string } | null>(null),
     [zoom, setZoom] = useState(1),
     [fit, setFit] = useState(0.4),
     [pan, setPan] = useState({ x: 0, y: 0 }),
+    [isPanning, setIsPanning] = useState(false),
     [status, setStatus] = useState('Ready'),
     [busy, setBusy] = useState(false),
     [activeTab, setActiveTab] = useState<'widgets' | 'backgrounds'>('widgets'),
-    [bgSubtab, setBgSubtab] = useState<'presets' | 'solid'>(() => {
-      return (localStorage.getItem('lumien_bg_subtab') as 'presets' | 'solid') || 'presets';
-    }),
-    [solidColor, setSolidColor] = useState<string>(() => {
-      return localStorage.getItem('lumien_solid_color') || '#000000';
-    }),
-    [hexInput, setHexInput] = useState<string>(() => {
-      return (localStorage.getItem('lumien_solid_color') || '#000000').toUpperCase();
-    }),
+    [bgSubtab, setBgSubtab] = useState<BgTab>(() => readStored('lumien_bg_subtab', ['presets', 'solid', 'video'] as const, 'presets')),
+    [solidColor, setSolidColor] = useState<string>(() => normalizeHex(load('lumien_solid_color') ?? '#000000')),
+    [hexInput, setHexInput] = useState<string>(() => solidColor.toUpperCase()),
     [presets, setPresets] = useState<PresetItem[]>([]),
     [presetsLoading, setPresetsLoading] = useState(false),
     [importing, setImporting] = useState(false),
@@ -145,8 +183,10 @@ function App() {
       message: 'Checking device status...',
     });
 
+  const chooseBgTab = (tab: BgTab) => { setBgSubtab(tab); store('lumien_bg_subtab', tab); };
+
   useEffect(() => {
-    if (!desktop || activeTab !== 'backgrounds' || youtubeBusy) return;
+    if (!desktop || activeTab !== 'backgrounds' || bgSubtab !== 'video' || youtubeBusy) return;
     let active = true;
     setGalleryLoading(true); setGalleryError('');
     invoke<DownloadedVideo[]>('list_downloaded_videos')
@@ -154,7 +194,7 @@ function App() {
       .catch(error => { if (active) setGalleryError(String(error)); })
       .finally(() => { if (active) setGalleryLoading(false); });
     return () => { active = false; };
-  }, [desktop, activeTab, youtubeBusy]);
+  }, [desktop, activeTab, bgSubtab, youtubeBusy]);
 
   useEffect(() => {
     if (desktop) invoke<LayoutOption[]>('list_layouts').then(setLayouts).catch(error => setStatus(String(error)));
@@ -162,6 +202,7 @@ function App() {
 
   const renameStart = useRef<Scene | null>(null);
   const colorStart = useRef<Scene | null>(null);
+  const editStart = useRef<{ scene: Scene; id: string } | null>(null);
   const discardDialog = useRef<HTMLDialogElement>(null);
   const fileOperation = useRef(false);
   const startupApply = useRef<Scene | null>(null);
@@ -177,7 +218,8 @@ function App() {
     grid = scene.grid ?? true,
     snap = scene.snap ?? false,
     division = scene.split ?? true,
-    bend = scene.bend ?? true;
+    bend = scene.bend ?? true,
+    tone = toneOf(status);
 
   useEffect(() => {
     if (!desktop) return;
@@ -215,18 +257,13 @@ function App() {
     if (!desktop) return;
     setPresetsLoading(true);
     invoke<PresetItem[]>('list_presets')
-      .then((list) => {
-        setPresets(list);
-      })
-      .catch((err) => {
-        console.error('Failed to list presets:', err);
-      })
+      .then(setPresets)
+      .catch((err) => setStatus('Could not load background presets: ' + String(err)))
       .finally(() => setPresetsLoading(false));
   }, [desktop]);
 
   useEffect(() => {
     if (scene.bgType === 'solid') {
-      setBgSubtab('solid');
       setSolidColor(scene.bgColor ?? '#000000');
       setHexInput((scene.bgColor ?? '#000000').toUpperCase());
       return;
@@ -235,8 +272,7 @@ function App() {
       const preset = presets.find((item) => item.file_name === scene.bgFile);
       setActivePresetFile(scene.bgFile);
       setPreviewBackground(preset?.thumbnail ?? '');
-      setBgSubtab('presets');
-      if (!preset && !presetsLoading) setStatus(`Background preview unavailable for saved media: ${scene.bgFile}. Apply will still send its saved filename to the LCD.`);
+      if (!preset && !presetsLoading && presets.length) setStatus(`Background preview unavailable for saved media: ${scene.bgFile}. Apply will still send its saved filename to the LCD.`);
       return;
     }
     const active = presets.find((item) => item.is_active);
@@ -246,10 +282,18 @@ function App() {
     }
   }, [scene.bgType, scene.bgColor, scene.bgFile, presets, presetsLoading]);
 
+  // Runs a device operation with the shared busy lock so double clicks never interleave USB uploads.
+  async function exclusive(task: () => Promise<void>) {
+    if (busy) return;
+    startupApply.current = null;
+    setBusy(true);
+    try { await task(); } finally { setBusy(false); }
+  }
+
   const importPresets = async () => {
-    if (!desktop) return;
+    if (!desktop || importing) return;
     setImporting(true);
-    setStatus('Importing presets from KANALI...');
+    setStatus('Importing presets from KANALI…');
     try {
       const list = await invoke<PresetItem[]>('import_kanali_presets');
       setPresets(list);
@@ -266,34 +310,29 @@ function App() {
     }
   };
 
-  const applyPreset = async (p: PresetItem) => {
+  const applyPreset = (p: PresetItem) => exclusive(async () => {
     if (!desktop) return;
-    setStatus(`Applying background "${p.name}" to display...`);
+    setStatus(`Applying background “${p.name}”…`);
     try {
       await invoke('set_display_background', { fileName: p.file_name });
       setActivePresetFile(p.file_name);
       setPreviewBackground(p.thumbnail);
-      setPresets((prev) =>
-        prev.map((item) => ({ ...item, is_active: item.file_name === p.file_name }))
-      );
+      setPresets((prev) => prev.map((item) => ({ ...item, is_active: item.file_name === p.file_name })));
       const updatedScene: Scene = { ...scene, bgType: 'preset', bgFile: p.file_name };
       commit(updatedScene);
-      localStorage.setItem('lumien_bg_subtab', 'presets');
-      setStatus(`Background "${p.name}" applied.`);
-      if (scene.widgets.some((widget) => widget.visible)) {
-        await device.applyScene(updatedScene);
-      }
+      if (scene.widgets.some((widget) => widget.visible)) await device.applyScene(updatedScene);
+      setStatus(`Background “${p.name}” applied.`);
     } catch (err) {
       setStatus(`Failed to apply background: ${err}`);
     }
-  };
+  });
 
   // The native color input fires on every drag tick: preview while picking, commit one undo step on blur.
   const onColorPickerChange = (color: string) => {
     const norm = normalizeHex(color);
     setSolidColor(norm);
     setHexInput(norm.toUpperCase());
-    localStorage.setItem('lumien_solid_color', norm);
+    store('lumien_solid_color', norm);
     colorStart.current ??= scene;
     dispatch({ type: 'preview', scene: { ...scene, bgType: 'solid', bgColor: norm, bgFile: undefined } });
   };
@@ -310,7 +349,7 @@ function App() {
     if (/^#[0-9a-fA-F]{6}$/.test(clean)) {
       const norm = clean.toLowerCase();
       setSolidColor(norm);
-      localStorage.setItem('lumien_solid_color', norm);
+      store('lumien_solid_color', norm);
       commit({ ...scene, bgType: 'solid', bgColor: norm, bgFile: undefined });
     }
   };
@@ -319,58 +358,98 @@ function App() {
     const norm = normalizeHex(hex);
     setSolidColor(norm);
     setHexInput(norm.toUpperCase());
-    localStorage.setItem('lumien_solid_color', norm);
+    store('lumien_solid_color', norm);
     commit({ ...scene, bgType: 'solid', bgColor: norm, bgFile: undefined });
   };
 
-  const applySolidColor = async (color: string) => {
+  const applySolidColor = (color: string) => exclusive(async () => {
     const norm = normalizeHex(color);
     setSolidColor(norm);
     setHexInput(norm.toUpperCase());
-    localStorage.setItem('lumien_bg_subtab', 'solid');
-    localStorage.setItem('lumien_solid_color', norm);
+    store('lumien_solid_color', norm);
     const updatedScene: Scene = { ...scene, bgType: 'solid', bgColor: norm, bgFile: undefined };
     commit(updatedScene);
-    setStatus(`Applying solid background (${norm}) to display...`);
+    setStatus(`Applying solid background ${norm.toUpperCase()}…`);
     try {
       if (desktop) {
         await invoke('set_solid_color_background', { color: norm });
         setActivePresetFile('');
         setPreviewBackground('');
       }
-      if (scene.widgets.some((widget) => widget.visible)) {
-        await device.applyScene(updatedScene);
-      }
-      setStatus(`Solid color background (${norm}) applied to display.`);
+      if (scene.widgets.some((widget) => widget.visible)) await device.applyScene(updatedScene);
+      setStatus(`Solid background ${norm.toUpperCase()} applied.`);
     } catch (err) {
       setStatus(`Failed to apply solid color: ${err}`);
     }
-  };
+  });
+
+  const applyToDisplay = () => exclusive(async () => {
+    setStatus('Applying layout to display…');
+    try {
+      if (desktop) {
+        if (previewScene.bgType === 'solid') await invoke('set_solid_color_background', { color: previewScene.bgColor });
+        else if (previewScene.bgFile) await invoke('set_display_background', { fileName: previewScene.bgFile });
+      }
+      setStatus(await device.applyScene(parseScene(JSON.stringify(previewScene))));
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+
+  const clearScreen = () => exclusive(async () => {
+    try { setStatus(await device.clearDisplay()); } catch (e) { setStatus(String(e)); }
+  });
+
+  async function playVideo(label: string, run: () => Promise<string>, after?: () => void) {
+    if (busy) return;
+    setYoutubeBusy(true); setBusy(true); setStatus(label);
+    try { setStatus(await run()); after?.(); }
+    catch (error) { setStatus('Video playback failed: ' + String(error)); }
+    finally { setYoutubeBusy(false); setBusy(false); }
+  }
+
+  async function removeVideo(video: DownloadedVideo) {
+    if (busy || !window.confirm(`Remove “${video.title}” and all duplicate downloads from this computer?`)) return;
+    setBusy(true);
+    try {
+      await invoke('remove_downloaded_video', { id: video.id });
+      setDownloadedVideos(items => items.filter(item => item.id !== video.id));
+      if (selectedVideo === video.id) setSelectedVideo(null);
+      setStatus('Downloaded video and duplicate copies removed.');
+    } catch (error) { setStatus('Could not remove video: ' + String(error)); }
+    finally { setBusy(false); }
+  }
 
   useEffect(() => {
     const wasPending = startupApply.current !== null;
     const restored = takeStartupScene(startupApply, scene,
       desktop && !starting && !fileBusy && !pending && !busy && deviceState.connected);
     if (!restored) {
-      if (wasPending && !startupApply.current) setStatus('Startup apply cancelled: layout changed. Use Apply to Display when ready.');
-      else if (startupApply.current && !starting && !deviceState.connected) setStatus('Layout restored. Waiting for LCD connection…');
+      if (wasPending && !startupApply.current) setStatus('Startup apply cancelled: layout changed. Use Apply to display when ready.');
+      else if (startupApply.current && !starting && !deviceState.connected) setStatus('Layout restored. Waiting for the display to connect…');
       return;
     }
     setBusy(true);
-    setStatus('Applying restored layout to LCD…');
+    setStatus('Applying restored layout to display…');
     void (async () => {
       try {
-        if (desktop) {
-          if (restored.bgType === 'solid') {
-            await invoke('set_solid_color_background', { color: restored.bgColor });
-          } else if (restored.bgFile) {
-            await invoke('set_display_background', { fileName: restored.bgFile });
+        // At boot the display may still be starting. A failed background step must not skip the layout:
+        // apply_scene queues it and the backend worker re-sends the saved background once the display answers.
+        try {
+          if (desktop) {
+            if (restored.bgType === 'solid') {
+              await invoke('set_solid_color_background', { color: restored.bgColor });
+            } else if (restored.bgFile) {
+              await invoke('set_display_background', { fileName: restored.bgFile });
+            }
           }
+        } catch (e) {
+          console.warn('Startup background not applied yet:', e);
         }
         const message = await device.applyScene(parseScene(JSON.stringify(withTelemetry(restored, readings))));
         setStatus('Startup apply: ' + message);
       } catch (e) {
-        setStatus('Startup apply failed: ' + String(e) + '. Use Apply to Display to retry.');
+        setStatus('Startup apply failed: ' + String(e) + '. Use Apply to display to retry.');
       } finally { setBusy(false); }
     })();
   }, [desktop, starting, fileBusy, pending, busy, deviceState.connected, scene]);
@@ -378,7 +457,7 @@ function App() {
   useEffect(() => {
     const r = new ResizeObserver(() => {
       if (viewport.current) {
-        setFit(Math.min((viewport.current.clientWidth - 100) / 2240, (viewport.current.clientHeight - 100) / 1080));
+        setFit(Math.min((viewport.current.clientWidth - 80) / 2240, (viewport.current.clientHeight - 80) / 1080));
       }
     });
     if (viewport.current) r.observe(viewport.current);
@@ -406,13 +485,15 @@ function App() {
     const poll = async () => {
       if (!desktop) return;
       try {
-        const telemetry = await device.getTelemetry();
+        const [telemetry, tempStatus] = await Promise.all([device.getTelemetry(), device.getCpuTemperatureStatus()]);
         if (!active || Object.keys(telemetry).length === 0) return;
         setReadings(telemetry);
+        setCpuTempStatus(tempStatus);
       } catch {
-        // silent telemetry poll catch
+        // telemetry is best effort; widgets fall back to their saved values
       }
     };
+    void poll();
     const id = setInterval(poll, 1500);
     return () => {
       active = false;
@@ -424,9 +505,38 @@ function App() {
     dispatch({ type: 'commit', scene: next });
   }
 
+  const withWidget = (base: Scene, id: string, p: Partial<Widget>): Scene =>
+    ({ ...base, widgets: base.widgets.map((v) => (v.id === id ? geometry({ ...v, ...p }) : v)) });
+
   function patch(p: Partial<Widget>) {
-    if (w) commit({ ...scene, widgets: scene.widgets.map((v) => (v.id === w.id ? geometry({ ...v, ...p }) : v)) });
+    if (w) commit(withWidget(scene, w.id, p));
   }
+
+  // Continuous inspector edits (typing, color dragging) preview live and land as one undo step on blur.
+  function beginEdit() {
+    if (w) editStart.current ??= { scene, id: w.id };
+  }
+  function previewEdit(p: Partial<Widget>) {
+    if (!w) return;
+    editStart.current ??= { scene, id: w.id };
+    dispatch({ type: 'preview', scene: withWidget(scene, editStart.current.id, p) });
+  }
+  function endEdit(p?: Partial<Widget>) {
+    const start = editStart.current;
+    editStart.current = null;
+    if (!start) { if (p) patch(p); return; }
+    dispatch({ type: 'commit', scene: p ? withWidget(scene, start.id, p) : scene, before: start.scene });
+  }
+  const live = <K extends keyof Widget>(key: K) => ({
+    onFocus: beginEdit,
+    onChange: (e: { target: { value: string } }) => previewEdit({ [key]: e.target.value } as Partial<Widget>),
+    onBlur: () => endEdit(),
+  });
+  const numberProps = (key: keyof Widget) => ({
+    onBegin: beginEdit,
+    onPreview: (v: number) => previewEdit({ [key]: v } as Partial<Widget>),
+    onCommit: (v?: number) => endEdit(v === undefined ? undefined : { [key]: v } as Partial<Widget>),
+  });
 
   function undo() { dispatch({ type: 'undo' }); }
   function redo() { dispatch({ type: 'redo' }); }
@@ -445,45 +555,30 @@ function App() {
     }
   }
 
-  function add(kind: Kind, x = 120, y = 120) {
+  function insert(widget: Widget) {
     if (scene.widgets.length >= 100) {
       setStatus('Editor limit: 100 widgets');
       return;
     }
-    const a = createWidget(kind, x, y);
-    commit({ ...scene, widgets: [...scene.widgets, a] });
-    select(a.id);
+    commit({ ...scene, widgets: [...scene.widgets, widget] });
+    select(widget.id);
   }
 
-  function addSensor(binding: string, name: string, text: string, color = '#ffffff') {
-    if (scene.widgets.length >= 100) {
-      setStatus('Editor limit: 100 widgets');
-      return;
-    }
+  function add(kind: Kind, x = 120, y = 120) {
+    insert(createWidget(kind, x, y));
+  }
+
+  function addSensor(binding: string, name: string, text: string) {
     const offset = (scene.widgets.length % 6) * 30;
-    const a = geometry({
-      id: crypto.randomUUID(),
-      kind: 'Metric value' as const,
+    insert(geometry({
+      ...createWidget('Metric value', 120 + offset, 120 + offset),
       name,
-      x: 120 + offset,
-      y: 120 + offset,
       width: isNetwork(binding) ? 600 : 420,
       height: 220,
-      visible: true,
-      locked: false,
       text,
-      color,
-      background: '#18262e',
-      fontSize: 64,
       value: 0,
       binding,
-      image: '',
-      fontFamily: 'roboto',
-      bold: false,
-      italic: false,
-    });
-    commit({ ...scene, widgets: [...scene.widgets, a] });
-    select(a.id);
+    }));
   }
 
   function point(x: number, y: number) {
@@ -497,6 +592,10 @@ function App() {
       j = Math.max(0, Math.min(items.length - 1, i + delta));
     [items[i], items[j]] = [items[j], items[i]];
     commit({ ...scene, widgets: items });
+  }
+
+  function toggleWidget(id: string, key: 'visible' | 'locked') {
+    commit({ ...scene, widgets: scene.widgets.map((a) => (a.id === id ? { ...a, [key]: !a[key] } : a)) });
   }
 
   function replaceDocument(next: Scene, path: string | null, remember = true) {
@@ -598,28 +697,22 @@ function App() {
   useEffect(() => {
     function key(e: KeyboardEvent) {
       if (pending || fileBusy) return;
-      if ((e.ctrlKey || e.metaKey) && ['s', 'n'].includes(e.key.toLowerCase())) {
+      const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
+      if (mod && (k === 's' || k === 'n')) {
         e.preventDefault();
-        if (e.key.toLowerCase() === 's') void save(e.shiftKey);
+        if (k === 's') void save(e.shiftKey);
         else newLayout();
         return;
       }
       if ((e.target as HTMLElement).closest('input,textarea,select,[contenteditable]')) return;
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault();
-        e.shiftKey ? redo() : undo();
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') {
-        e.preventDefault();
-        duplicate();
-        return;
-      }
-      if (e.key === 'Delete') {
-        remove();
-        return;
-      }
+      if (mod && k === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+      if (mod && k === 'y') { e.preventDefault(); redo(); return; }
+      if (mod && k === 'd') { e.preventDefault(); duplicate(); return; }
+      if (mod && (k === '=' || k === '+')) { e.preventDefault(); setZoom(z => Math.min(5, z * 1.25)); return; }
+      if (mod && k === '-') { e.preventDefault(); setZoom(z => Math.max(0.25, z / 1.25)); return; }
+      if (mod && k === '0') { e.preventDefault(); setZoom(1); setPan({ x: 0, y: 0 }); return; }
+      if (e.key === 'Escape') { select(null); return; }
+      if (e.key === 'Delete' || e.key === 'Backspace') { remove(); return; }
       if (!w || w.locked) return;
       const n = e.shiftKey ? 10 : 1;
       const d: Record<string, [number, number]> = {
@@ -637,472 +730,323 @@ function App() {
     return () => window.removeEventListener('keydown', key);
   });
 
+  const docLocked = fileBusy || !!pending;
+  const canvasBg = showCanvasBg && scene.bgType === 'solid' ? solidColor : '#000000';
+  const fam = (w?.fontFamily || 'roboto').toLowerCase();
+  const singleWeight = fam === 'orbitron' || fam === 'bitcount-single' || fam === 'rubik-glitch';
+
   return (
-    <div className="app" inert={starting || youtubeBusy} aria-busy={starting}>
-      <header>
+    <div className="app" inert={starting || youtubeBusy} aria-busy={starting || busy}>
+      <header className="topbar">
         <div className="brand">
-          <span>◈</span> Lumien
+          <span className="brand-mark"><Icon name="logo" size={17} /></span>
+          Lumien
         </div>
-        <input
-          aria-label="Layout name"
-          className="layout-name"
-          maxLength={120}
-          value={scene.name}
-          disabled={fileBusy || !!pending}
-          title={filePath ?? 'Layout has not been saved to a file'}
-          onFocus={() => { renameStart.current = scene; }}
-          onChange={(e) => dispatch({ type: 'preview', scene: { ...scene, name: e.target.value } })}
-          onBlur={() => {
-            if (renameStart.current) dispatch({ type: 'commit', scene, before: renameStart.current });
-            renameStart.current = null;
-          }}
-        />
-        <span className="dirty" role="status" aria-label="Layout save status" title={filePath ?? 'No file yet'}>{dirty ? '● Unsaved' : filePath ? 'Saved' : 'New layout'}</span>
-        <button disabled={fileBusy || !!pending} onClick={newLayout} title="New layout (Ctrl+N)">New</button>
-        <select aria-label="Choose layout to preview" className="layout-picker" value={filePath ?? ''}
-          disabled={fileBusy || !!pending} onChange={e => void selectLayout(e.target.value)}>
-          <option value="">Choose layout…</option>
-          {layouts.map(layout => <option key={layout.path} value={layout.path}>{layout.name}</option>)}
-        </select>
-        <button disabled={fileBusy || !!pending} onClick={() => void save()} title="Save (Ctrl+S); Save As (Ctrl+Shift+S)">{fileBusy ? 'Working…' : 'Save'}</button>
-        <i />
-        <button aria-label="Undo" disabled={!past.length || fileBusy || !!pending} onClick={undo} title="Undo (Ctrl+Z)">↶</button>
-        <button aria-label="Redo" disabled={!future.length || fileBusy || !!pending} onClick={redo} title="Redo (Ctrl+Shift+Z / Ctrl+Y)">↷</button>
-        <div className={`device-dot ${deviceState.connected ? 'connected' : ''}`}>
-          {deviceState.connected ? '● Device Online' : '○ Device Disconnected'}
+        <div className="doc">
+          <input
+            aria-label="Layout name"
+            className="doc-name"
+            maxLength={120}
+            value={scene.name}
+            disabled={docLocked}
+            title={filePath ?? 'Layout has not been saved to a file'}
+            onFocus={() => { renameStart.current = scene; }}
+            onChange={(e) => dispatch({ type: 'preview', scene: { ...scene, name: e.target.value } })}
+            onBlur={() => {
+              if (renameStart.current) dispatch({ type: 'commit', scene, before: renameStart.current });
+              renameStart.current = null;
+            }}
+          />
+          <span className={`save-state ${dirty ? 'dirty' : ''}`} role="status" aria-label="Layout save status" title={filePath ?? 'No file yet'}>
+            {dirty ? 'Unsaved' : filePath ? 'Saved' : 'Not saved'}
+          </span>
         </div>
-        <button
-          disabled={busy || !deviceState.connected}
-          onClick={async () => {
-            startupApply.current = null;
-            setBusy(true);
-            try {
-              setStatus(await device.clearDisplay());
-            } catch (e) {
-              setStatus(String(e));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          Clear Screen
+        <div className="tool-group">
+          <button className="ghost icon-btn" aria-label="New layout" disabled={docLocked} onClick={newLayout} title="New layout (Ctrl+N)"><Icon name="file" /></button>
+          <select aria-label="Open saved layout" className="layout-picker" value={filePath ?? ''}
+            disabled={docLocked || !layouts.length} onChange={e => void selectLayout(e.target.value)}>
+            <option value="">{layouts.length ? 'Open layout…' : 'No saved layouts'}</option>
+            {layouts.map(layout => <option key={layout.path} value={layout.path}>{layout.name}</option>)}
+          </select>
+          <button className="ghost" disabled={docLocked} onClick={() => void save()} title="Save (Ctrl+S) · Save as (Ctrl+Shift+S)">
+            {fileBusy && !starting ? <span className="spinner" /> : <Icon name="save" />} Save
+          </button>
+        </div>
+        <div className="tool-group">
+          <button className="ghost icon-btn" aria-label="Undo" disabled={!past.length || docLocked} onClick={undo} title="Undo (Ctrl+Z)"><Icon name="undo" /></button>
+          <button className="ghost icon-btn" aria-label="Redo" disabled={!future.length || docLocked} onClick={redo} title="Redo (Ctrl+Y)"><Icon name="redo" /></button>
+        </div>
+        <div className="spacer" />
+        <div className={`device-chip ${deviceState.connected ? 'online' : ''}`} title={deviceState.message} role="status">
+          <span className="dot" />{deviceState.connected ? 'Display connected' : 'No display'}
+        </div>
+        <button className="ghost" disabled={busy || !deviceState.connected} onClick={clearScreen} title="Remove all widgets from the LCD">
+          <Icon name="screenOff" /> Clear
         </button>
-        <button
-          className="primary"
-          disabled={busy}
-          onClick={async () => {
-            startupApply.current = null;
-            setBusy(true);
-            try {
-              if (desktop) {
-                if (previewScene.bgType === 'solid') {
-                  await invoke('set_solid_color_background', { color: previewScene.bgColor });
-                } else if (previewScene.bgFile) {
-                  await invoke('set_display_background', { fileName: previewScene.bgFile });
-                }
-              }
-              setStatus(await device.applyScene(parseScene(JSON.stringify(previewScene))));
-            } catch (e) {
-              setStatus(String(e));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {busy ? 'Applying…' : 'Apply to Display'}
+        <button className="primary" disabled={busy} onClick={applyToDisplay} title="Send this layout and its background to the LCD">
+          {busy ? <span className="spinner" /> : <Icon name="send" />}
+          {busy ? 'Applying…' : 'Apply to display'}
         </button>
       </header>
 
       <dialog ref={discardDialog} className="document-dialog" aria-labelledby="unsaved-title" onCancel={(e) => { e.preventDefault(); if (!fileBusy) setPending(null); }}>
-        <h2 id="unsaved-title">Save changes to {scene.name || 'Untitled layout'}?</h2>
-        <p>Your layout has unsaved changes.</p>
+        <h2 id="unsaved-title">Save changes to “{scene.name || 'Untitled layout'}”?</h2>
+        <p>Your changes will be lost if you don't save them.</p>
         {fileError && <p role="alert">{fileError}</p>}
-        <div>
-          <button autoFocus disabled={fileBusy} onClick={() => setPending(null)}>Cancel</button>
-          <button disabled={fileBusy} onClick={continuePending}>Discard changes</button>
-          <button className="primary" disabled={fileBusy} onClick={async () => { if (await save()) continuePending(); }}>Save changes</button>
+        <div className="dialog-actions">
+          <button className="ghost" autoFocus disabled={fileBusy} onClick={() => setPending(null)}>Cancel</button>
+          <button className="danger" disabled={fileBusy} onClick={continuePending}>Don't save</button>
+          <button className="primary" disabled={fileBusy} onClick={async () => { if (await save()) continuePending(); }}>Save</button>
         </div>
       </dialog>
-      <div className="body">
-        <aside className="left">
-          <div className="sidebar-tabs">
-            <button
-              className={`sidebar-tab ${activeTab === 'widgets' ? 'active' : ''}`}
-              onClick={() => setActiveTab('widgets')}
-            >
-              Widgets
+
+      <div className="workspace">
+        <aside className="sidebar left">
+          <div className="segmented" role="tablist" aria-label="Sidebar">
+            <button role="tab" aria-selected={activeTab === 'widgets'} onClick={() => setActiveTab('widgets')}>
+              <Icon name="layers" size={14} /> Widgets
             </button>
-            <button
-              className={`sidebar-tab ${activeTab === 'backgrounds' ? 'active' : ''}`}
-              onClick={() => setActiveTab('backgrounds')}
-            >
-              Backgrounds {presets.length > 0 && <span className="tab-badge">{presets.length}</span>}
+            <button role="tab" aria-selected={activeTab === 'backgrounds'} onClick={() => setActiveTab('backgrounds')}>
+              <Icon name="image" size={14} /> Background
             </button>
           </div>
 
-          {activeTab === 'widgets' ? (
-            <>
-              <h2>INSERT WIDGET</h2>
-              <p className="muted">Drag onto the display canvas</p>
-              <div className="palette">
-                {kinds.map((kind, i) => (
-                  <button
-                    key={kind}
-                    draggable
-                    onDragStart={(e) => e.dataTransfer.setData('lumien/widget', kind)}
-                    onClick={() => add(kind)}
-                  >
-                    <span>{['42', 'T'][i]}</span>
-                    {kind}
-                  </button>
-                ))}
-              </div>
-              <div className="section-heading">
-                <h2>LAYERS</h2>
-                <span>{scene.widgets.length}</span>
-              </div>
-              <div className="layers">
-                {[...scene.widgets].reverse().map((v) => (
-                  <div key={v.id} className={'layer ' + (selected === v.id ? 'active' : '')}>
-                    <button className="layer-name" onClick={() => select(v.id)}>
-                      {v.name}
-                    </button>
-                    <button
-                      aria-label={'Toggle visibility ' + v.name}
-                      onClick={() =>
-                        commit({
-                          ...scene,
-                          widgets: scene.widgets.map((a) => (a.id === v.id ? { ...a, visible: !a.visible } : a)),
-                        })
-                      }
-                    >
-                      {v.visible ? '◉' : '○'}
-                    </button>
-                    <button
-                      aria-label={'Toggle lock ' + v.name}
-                      onClick={() =>
-                        commit({
-                          ...scene,
-                          widgets: scene.widgets.map((a) => (a.id === v.id ? { ...a, locked: !a.locked } : a)),
-                        })
-                      }
-                    >
-                      {v.locked ? '◆' : '◇'}
-                    </button>
-                  </div>
-                ))}
-              </div>
-              <div className="section-heading" style={{ marginTop: '20px' }}>
-                <h2>AVAILABLE SENSORS</h2>
-                <span>{sensors.length}</span>
-              </div>
-              <div className="sensor-list" style={{ display: 'flex', flexDirection: 'column', gap: '6px', margin: '8px 0 16px' }}>
-                {sensors.map((s) => (
-                  <button
-                    key={s.binding}
-                    style={{ textAlign: 'left', padding: '6px 10px', fontSize: '11px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                    onClick={() => addSensor(s.binding, s.name, s.text)}
-                  >
-                    <span>+ {s.name}</span>
-                    <small style={{ color: '#ffffff', fontWeight: 600 }}>{formatMetric(s.binding, null).unit}</small>
-                  </button>
-                ))}
-              </div>
-            </>
-          ) : (
-            <div className="presets-container">
-              <section className="youtube-panel" aria-label="YouTube video">
-                <h2>YOUTUBE VIDEO</h2>
-                <label htmlFor="youtube-url">YouTube link</label>
-                <input id="youtube-url" type="url" placeholder="https://www.youtube.com/watch?v=…" value={youtubeUrl} onChange={e => setYoutubeUrl(e.target.value)} />
-                <p>Recorded videos up to 5 minutes. Silent playback, cropped to fill the LCD. Widgets are hidden during playback.</p>
-                <button disabled={!desktop || !deviceState.connected || busy || !youtubeUrl.trim()} onClick={async () => {
-                  setYoutubeBusy(true); setBusy(true);
-                  setStatus('Downloading and converting YouTube video, then uploading to display…');
-                  try { setStatus(await invoke<string>('play_youtube', { url: youtubeUrl.trim() })); }
-                  catch (error) { setStatus('YouTube: ' + String(error)); }
-                  finally { setYoutubeBusy(false); setBusy(false); }
-                }}>Play full screen</button>
-              </section>
-              <section className="downloaded-gallery" aria-label="Downloaded videos">
-                <h2>DOWNLOADED VIDEOS ({downloadedVideos.length})</h2>
-                {galleryLoading && <p role="status">Loading videos…</p>}
-                {galleryError && <p role="alert">{galleryError}</p>}
-                {!galleryLoading && !galleryError && downloadedVideos.length === 0 && <p className="muted">Videos downloaded above appear here for replay.</p>}
-                {downloadedVideos.map(video => (
-                  <article key={video.id} className={`downloaded-video ${selectedVideo === video.id ? 'selected' : ''}`}>
-                    <div className="downloaded-video-thumb">
-                      {video.thumbnail ? <img src={video.thumbnail} alt={`${video.title} thumbnail`} /> : <span className="video-placeholder">▶</span>}
-                      <button type="button" className="video-delete" disabled={busy}
-                        aria-label={`Remove ${video.title} and duplicate downloads`} title="Remove downloaded video"
-                        onClick={async () => {
-                          if (!window.confirm(`Remove “${video.title}” and all duplicate downloads from this computer?`)) return;
-                          setBusy(true);
-                          try {
-                            await invoke('remove_downloaded_video', { id: video.id });
-                            setDownloadedVideos(items => items.filter(item => item.id !== video.id));
-                            if (selectedVideo === video.id) setSelectedVideo(null);
-                            setStatus('Downloaded video and duplicate copies removed.');
-                          } catch (error) { setStatus('Could not remove video: ' + String(error)); }
-                          finally { setBusy(false); }
-                        }}>
-                        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m4 4v6m6-6v6" /></svg>
+          <div className="sidebar-scroll" role="tabpanel">
+            {activeTab === 'widgets' ? (
+              <>
+                <section className="section">
+                  <h2 className="section-title">Add to display</h2>
+                  <div className="add-grid">
+                    {kinds.map((kind) => (
+                      <button key={kind} className="add-tile" draggable
+                        onDragStart={(e) => e.dataTransfer.setData('lumien/widget', kind)}
+                        onClick={() => add(kind)}>
+                        <span className="tile-icon"><Icon name={kind === 'Text' ? 'text' : 'gauge'} size={17} /></span>
+                        <strong>{kind === 'Text' ? 'Text' : 'Live metric'}</strong>
+                        <small>{kind === 'Text' ? 'Title or label' : 'Sensor reading'}</small>
                       </button>
-                    </div>
-                    <button type="button" className="downloaded-video-play" disabled={busy || !deviceState.connected}
-                      aria-pressed={selectedVideo === video.id} title={`Play ${video.title} on display`}
-                      onClick={async () => {
-                        setYoutubeBusy(true); setBusy(true); setStatus('Uploading saved video to display…');
-                        try {
-                          setStatus(await invoke<string>('play_downloaded_video', { id: video.id }));
-                          setSelectedVideo(video.id);
-                        } catch (error) { setStatus('Video playback failed: ' + String(error)); }
-                        finally { setYoutubeBusy(false); setBusy(false); }
-                      }}>
-                      <strong>{video.title}</strong>
-                      <small>{Math.floor(video.duration / 60)}:{String(Math.floor(video.duration % 60)).padStart(2, '0')} · {(video.bytes / 1048576).toFixed(1)} MB</small>
-                      <span>{selectedVideo === video.id ? 'Selected · Play again' : '▶ Play on display'}</span>
-                    </button>
-                  </article>
-                ))}
-              </section>
-              <div className="presets-header" style={{ marginBottom: '12px' }}>
-                <h2>BACKGROUND OPTIONS</h2>
-                <div className="bg-subtabs">
-                  <button
-                    className={`bg-subtab ${bgSubtab === 'presets' ? 'active' : ''}`}
-                    onClick={() => {
-                      setBgSubtab('presets');
-                      localStorage.setItem('lumien_bg_subtab', 'presets');
-                    }}
-                  >
-                    3D Presets ({presets.length})
+                    ))}
+                  </div>
+                  <p className="hint">Click to add, or drag onto the display.</p>
+                </section>
+
+                <section className="section">
+                  <h2 className="section-title">Sensors <span className="count">{sensors.length}</span></h2>
+                  <div className="sensor-list">
+                    {sensors.map((s) => (
+                      <button key={s.binding} className="sensor-btn" onClick={() => addSensor(s.binding, s.name, s.text)} title={`Add a ${s.name} widget`}>
+                        <span className="sensor-icon"><Icon name={sensorIcon(s.binding)} size={15} /></span>
+                        <span>{s.name}</span>
+                        <span className="unit">
+                          {s.key === 'cpu_temp'
+                            ? (readings.cpu_temp != null ? `${readings.cpu_temp} °C` : '—')
+                            : readings[s.key] != null && !isNetwork(s.binding) ? `${Math.round(readings[s.key]!)} ${formatMetric(s.binding, 0).unit}` : formatMetric(s.binding, null).unit}
+                        </span>
+                        <span className="add"><Icon name="plus" size={14} /></span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="section">
+                  <h2 className="section-title">Layers <span className="count">{scene.widgets.length}</span></h2>
+                  {scene.widgets.length === 0 && <p className="hint">Nothing on the display yet. Add a metric or text above.</p>}
+                  <ul className="layer-list">
+                    {[...scene.widgets].reverse().map((v) => (
+                      <li key={v.id} className={`layer ${selected === v.id ? 'active' : ''} ${v.visible ? '' : 'hidden'}`}>
+                        <button className="layer-main" onClick={() => select(v.id)} aria-current={selected === v.id}>
+                          <Icon name={v.kind === 'Text' ? 'text' : sensorIcon(v.binding)} size={14} />
+                          <span>{v.name}</span>
+                        </button>
+                        <button className="icon-btn" aria-label={(v.visible ? 'Hide ' : 'Show ') + v.name} title={v.visible ? 'Hide' : 'Show'}
+                          onClick={() => toggleWidget(v.id, 'visible')}>
+                          <Icon name={v.visible ? 'eye' : 'eyeOff'} size={14} />
+                        </button>
+                        <button className={`icon-btn ${v.locked ? 'on' : ''}`} aria-label={(v.locked ? 'Unlock ' : 'Lock ') + v.name} title={v.locked ? 'Unlock' : 'Lock'}
+                          onClick={() => toggleWidget(v.id, 'locked')}>
+                          <Icon name={v.locked ? 'lock' : 'unlock'} size={14} />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              </>
+            ) : (
+              <section className="section">
+                <div className="segmented bg-tabs" role="tablist" aria-label="Background type">
+                  <button role="tab" aria-selected={bgSubtab === 'presets'} onClick={() => chooseBgTab('presets')}>
+                    <Icon name="film" size={14} /> Animated {presets.length > 0 && <span className="count">{presets.length}</span>}
                   </button>
-                  <button
-                    className={`bg-subtab ${bgSubtab === 'solid' ? 'active' : ''}`}
-                    onClick={() => {
-                      setBgSubtab('solid');
-                      localStorage.setItem('lumien_bg_subtab', 'solid');
-                      commit({ ...scene, bgType: 'solid', bgColor: solidColor, bgFile: undefined });
-                    }}
-                  >
-                    Solid Color
+                  <button role="tab" aria-selected={bgSubtab === 'solid'} onClick={() => chooseBgTab('solid')}>
+                    <Icon name="palette" size={14} /> Solid
+                  </button>
+                  <button role="tab" aria-selected={bgSubtab === 'video'} onClick={() => chooseBgTab('video')}>
+                    <Icon name="video" size={14} /> Video
                   </button>
                 </div>
-              </div>
 
-              {bgSubtab === 'presets' ? (
-                <>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                    <span style={{ fontSize: '11px', color: '#8fa0aa' }}>ANIMATION LOOPS</span>
-                    <button
-                      className="import-btn"
-                      disabled={importing}
-                      onClick={importPresets}
-                      title="Scan and import all presets from KANALI into Lumien storage"
-                    >
-                      {importing ? 'Importing from KANALI...' : '↻ Import from KANALI'}
-                    </button>
-                  </div>
-
-                  {presetsLoading ? (
-                    <p className="muted">Loading presets...</p>
-                  ) : presets.length === 0 ? (
-                    <div style={{ textAlign: 'center', padding: '20px 0', color: '#92a2ad' }}>
-                      <p>No presets found.</p>
-                      <button className="import-btn" onClick={importPresets}>
-                        Import from KANALI
+                {bgSubtab === 'presets' && (
+                  <>
+                    <div className="row-between">
+                      <span className="hint">Click a loop to show it on the display.</span>
+                      <button className="ghost icon-btn" disabled={importing || !desktop} onClick={importPresets} title="Import presets from KANALI" aria-label="Import presets from KANALI">
+                        {importing ? <span className="spinner" /> : <Icon name="download" />}
                       </button>
                     </div>
-                  ) : (
-                    <div className="presets-list">
-                      {presets.map((p) => {
-                        const isActive = scene.bgType !== 'solid' && p.file_name === activePresetFile;
-                        return (
-                          <div
-                            key={p.id}
-                            className={`preset-card ${isActive ? 'active' : ''}`}
-                            onClick={() => applyPreset(p)}
-                            title={`Click to set background to ${p.name}`}
-                          >
-                            <div className="preset-thumb-wrapper">
-                              {p.thumbnail ? (
-                                <img className="preset-thumb" src={p.thumbnail} alt={p.name} />
-                              ) : (
-                                <div style={{ width: '100%', height: '100%', background: '#1c242b', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#556570', fontSize: '11px' }}>
-                                  No preview
-                                </div>
-                              )}
-                              <span className={`preset-badge ${p.is_builtin ? 'builtin' : ''}`}>
-                                {p.is_builtin ? 'Built-in' : '3D Preset'}
+                    {presetsLoading ? (
+                      <p className="hint">Loading presets…</p>
+                    ) : presets.length === 0 ? (
+                      <div className="empty-state">
+                        <p>No animated backgrounds yet.</p>
+                        <button disabled={importing || !desktop} onClick={importPresets}><Icon name="download" /> Import from KANALI</button>
+                      </div>
+                    ) : (
+                      <div className="preset-list">
+                        {presets.map((p) => {
+                          const isActive = scene.bgType !== 'solid' && p.file_name === activePresetFile;
+                          return (
+                            <button key={p.id} className={`preset-card ${isActive ? 'active' : ''}`} disabled={busy || !desktop}
+                              aria-pressed={isActive} onClick={() => void applyPreset(p)} title={`Show ${p.name} on the display`}>
+                              {p.thumbnail ? <img className="thumb" src={p.thumbnail} alt="" /> : <span className="thumb empty">No preview</span>}
+                              <span className="preset-meta">
+                                <span>{p.name}</span>
+                                {isActive ? <span className="tag live">On display</span>
+                                  : <span className="tag"><span className="apply-hint">Apply · </span>{p.is_builtin ? 'Built-in' : 'Imported'}</span>}
                               </span>
-                            </div>
-                            <div className="preset-info">
-                              <span className="preset-title">{p.name}</span>
-                              {isActive ? (
-                                <span className="active-pill">
-                                  <span className="active-dot" /> ACTIVE
-                                </span>
-                              ) : (
-                                <button
-                                  className="preset-apply-btn"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    applyPreset(p);
-                                  }}
-                                >
-                                  Apply
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="solid-color-panel">
-                  <div className="color-preview-card">
-                    <div className="color-preview-box" style={{ backgroundColor: solidColor }}>
-                      <span className="preset-badge" style={{ position: 'absolute', top: 6, left: 6 }}>
-                        SOLID
-                      </span>
-                    </div>
-                    <div className="color-preview-info">
-                      <span className="color-hex-tag">{solidColor.toUpperCase()}</span>
-                      {scene.bgType === 'solid' ? (
-                        <span className="active-pill">
-                          <span className="active-dot" /> ACTIVE
-                        </span>
-                      ) : (
-                        <button
-                          className="preset-apply-btn"
-                          onClick={() => applySolidColor(solidColor)}
-                        >
-                          Apply
-                        </button>
-                      )}
-                    </div>
-                  </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </>
+                )}
 
-                  <div>
-                    <label style={{ fontSize: '11px', color: '#92a2ad', marginBottom: '6px', display: 'block' }}>
-                      CUSTOM COLOR / HEX
-                    </label>
-                    <div className="color-controls">
-                      <label className="color-picker-label">
-                        <span>Choose any color</span>
+                {bgSubtab === 'solid' && (
+                  <div className="solid-panel">
+                    <div className="color-preview">
+                      <div className="swatch-large" style={{ backgroundColor: solidColor }} />
+                      <div className="preset-meta">
+                        <code className="color-field">{solidColor.toUpperCase()}</code>
+                        {scene.bgType === 'solid' ? <span className="tag live">In layout</span> : <span className="tag">Preview</span>}
+                      </div>
+                    </div>
+                    <div className="color-row">
                       <input
                         type="color"
                         aria-label="Choose background color"
-                        className="color-picker-input"
                         value={solidColor}
                         onFocus={() => { colorStart.current = scene; }}
                         onChange={(e) => onColorPickerChange(e.target.value)}
                         onBlur={onColorPickerDone}
                         title="Open color picker"
                       />
-                      </label>
                       <input
                         type="text"
-                        className="color-hex-input"
                         aria-label="Background hex color"
                         value={hexInput}
                         onChange={(e) => onHexInputChange(e.target.value)}
+                        onBlur={() => setHexInput(solidColor.toUpperCase())}
                         placeholder="#000000"
                         maxLength={7}
                         spellCheck={false}
                       />
                     </div>
-                  </div>
-
-                  <div>
-                    <span style={{ fontSize: '10px', letterSpacing: '1px', color: '#8fa0aa', fontWeight: 600, display: 'block', marginBottom: '8px' }}>
-                      PRESELECTED PALETTE
-                    </span>
-                    <div className="swatches-grid">
-                      {SOLID_SWATCHES.map((sw) => {
-                        const isSelected = solidColor.toLowerCase() === sw.hex.toLowerCase();
-                        return (
-                          <button
-                            key={sw.hex}
-                            type="button"
-                            className={`swatch-btn ${isSelected ? 'active' : ''}`}
-                            aria-pressed={isSelected}
-                            onClick={() => onSelectSwatch(sw.hex)}
-                            title={`${sw.name} (${sw.hex}) — ${sw.note}`}
-                          >
-                            <span className="swatch-circle" style={{ backgroundColor: sw.hex }} />
-                            <span className="swatch-name">{sw.name}</span>
-                          </button>
-                        );
-                      })}
+                    <div className="swatches" role="group" aria-label="Preset colors">
+                      {SOLID_SWATCHES.map((sw) => (
+                        <button key={sw.hex} type="button" className="swatch" style={{ backgroundColor: sw.hex }}
+                          aria-pressed={solidColor === sw.hex} aria-label={sw.name}
+                          onClick={() => onSelectSwatch(sw.hex)} title={`${sw.name} · ${sw.note}`} />
+                      ))}
                     </div>
+                    <button className="primary block" disabled={busy} onClick={() => void applySolidColor(solidColor)}>
+                      {busy ? <span className="spinner" /> : <Icon name="send" />} Show on display
+                    </button>
                   </div>
+                )}
 
-                  <button
-                    className="solid-apply-btn"
-                    onClick={() => applySolidColor(solidColor)}
-                  >
-                    Apply to Display
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
+                {bgSubtab === 'video' && (
+                  <>
+                    <div className="video-form">
+                      <label className="field" htmlFor="youtube-url">
+                        YouTube link
+                        <input id="youtube-url" type="url" placeholder="https://www.youtube.com/watch?v=…" value={youtubeUrl} onChange={e => setYoutubeUrl(e.target.value)} />
+                      </label>
+                      <button className="primary block" disabled={!desktop || !deviceState.connected || busy || !youtubeUrl.trim()}
+                        onClick={() => void playVideo('Downloading, converting and uploading the video…', () => invoke<string>('play_youtube', { url: youtubeUrl.trim() }))}>
+                        <Icon name="play" /> Play full screen
+                      </button>
+                      <p className="hint">Up to 5 minutes, silent, cropped to fill the panel. Widgets are hidden while it plays.</p>
+                    </div>
+                    <h2 className="section-title" style={{ marginTop: 18 }}>Downloaded <span className="count">{downloadedVideos.length}</span></h2>
+                    {galleryLoading && <p className="hint" role="status">Loading videos…</p>}
+                    {galleryError && <p className="hint error" role="alert">{galleryError}</p>}
+                    {!galleryLoading && !galleryError && downloadedVideos.length === 0 && <p className="hint">Videos you play appear here for quick replay.</p>}
+                    <div className="video-list">
+                      {downloadedVideos.map(video => (
+                        <article key={video.id} className={`video-card ${selectedVideo === video.id ? 'selected' : ''}`}>
+                          <button type="button" className="video-play" disabled={busy || !deviceState.connected}
+                            aria-pressed={selectedVideo === video.id} title={`Play ${video.title} on the display`}
+                            onClick={() => void playVideo('Uploading saved video to the display…', () => invoke<string>('play_downloaded_video', { id: video.id }), () => setSelectedVideo(video.id))}>
+                            {video.thumbnail ? <img className="thumb" src={video.thumbnail} alt="" /> : <span className="thumb empty"><Icon name="play" size={22} /></span>}
+                            <span className="preset-meta">
+                              <strong>{video.title}</strong>
+                              <span className="tag">{Math.floor(video.duration / 60)}:{String(Math.floor(video.duration % 60)).padStart(2, '0')} · {(video.bytes / 1048576).toFixed(1)} MB{selectedVideo === video.id ? ' · Playing' : ''}</span>
+                            </span>
+                          </button>
+                          <button type="button" className="video-delete" disabled={busy}
+                            aria-label={`Remove ${video.title} and duplicate downloads`} title="Remove downloaded video"
+                            onClick={() => void removeVideo(video)}>
+                            <Icon name="trash" size={15} />
+                          </button>
+                        </article>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </section>
+            )}
+          </div>
 
-          <div className="capabilities">
-            <strong>HARDWARE DISPLAY</strong>
-            <p>2240 × 1080 AMOLED Curved</p>
-            <p>Front: 1120×1080 · Bend: 1060–1180 · Side: 1120×1080</p>
-            <p>{deviceState.message}</p>
+          <div className="hardware-card">
+            <strong>Panorama SE · 2240 × 1080</strong>
+            {deviceState.message}
           </div>
         </aside>
 
-        <section className="center">
-          <div className="canvas-toolbar">
-            <span>
-              DISPLAY <b>2240 × 1080</b>
-            </span>
-            <label>
-              <input type="checkbox" checked={grid} onChange={(e) => commit({ ...scene, grid: e.target.checked })} />
-              Grid
-            </label>
-            <label>
-              <input type="checkbox" checked={snap} onChange={(e) => commit({ ...scene, snap: e.target.checked })} />
-              Snap
-            </label>
-            <label>
-              <input type="checkbox" checked={division} onChange={(e) => commit({ ...scene, split: e.target.checked })} />
-              Split
-            </label>
-            <label>
-              <input type="checkbox" checked={bend} onChange={(e) => commit({ ...scene, bend: e.target.checked })} />
-              Bend
-            </label>
-            {(previewBackground || scene.bgType === 'solid') && (
-              <label title="Show background in canvas">
-                <input type="checkbox" checked={showCanvasBg} onChange={(e) => setShowCanvasBg(e.target.checked)} />
-                BG
-              </label>
-            )}
-            <button onClick={() => setZoom((z) => Math.max(0.25, z / 1.25))}>−</button>
-            <span>{Math.round(scale * 100)}%</span>
-            <button onClick={() => setZoom((z) => Math.min(5, z * 1.25))}>+</button>
-            <button
-              onClick={() => {
-                setZoom(1);
-                setPan({ x: 0, y: 0 });
-              }}
-            >
-              Fit
-            </button>
+        <section className="stage">
+          <div className="stage-toolbar">
+            <div className="stage-title">
+              <span>Display</span> <b>2240 × 1080</b>
+              <span className="zones">Front 1120 · Bend 1060–1180 · Side 1120</span>
+            </div>
+            <div className="toggle-group">
+              {([
+                ['grid', 'Grid', grid, 'grid'],
+                ['snap', 'Snap', snap, 'magnet'],
+                ['split', 'Split', division, 'split'],
+                ['bend', 'Bend', bend, 'bend'],
+              ] as const).map(([key, label, on, icon]) => (
+                <button key={key} className="toggle" aria-pressed={on} title={`${label} guide`} onClick={() => commit({ ...scene, [key]: !on })}>
+                  <Icon name={icon} size={14} /><span className="label">{label}</span>
+                </button>
+              ))}
+              {(previewBackground || scene.bgType === 'solid') && (
+                <button className="toggle" aria-pressed={showCanvasBg} title="Show the background on the canvas" onClick={() => setShowCanvasBg(v => !v)}>
+                  <Icon name="image" size={14} /><span className="label">Background</span>
+                </button>
+              )}
+            </div>
+            <div className="zoom-group">
+              <button className="ghost icon-btn" aria-label="Zoom out" title="Zoom out (Ctrl+−)" onClick={() => setZoom((z) => Math.max(0.25, z / 1.25))}><Icon name="minus" size={14} /></button>
+              <span className="zoom-value">{Math.round(scale * 100)}%</span>
+              <button className="ghost icon-btn" aria-label="Zoom in" title="Zoom in (Ctrl++)" onClick={() => setZoom((z) => Math.min(5, z * 1.25))}><Icon name="plus" size={14} /></button>
+              <button className="ghost icon-btn" aria-label="Fit to window" title="Fit (Ctrl+0)" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}><Icon name="fit" size={14} /></button>
+            </div>
           </div>
-
           <div
-            className="viewport"
+            className={`viewport ${isPanning ? 'panning' : ''}`}
             ref={viewport}
+            onWheel={(e) => setZoom((z) => clamp(z * (e.deltaY < 0 ? 1.1 : 1 / 1.1), 0.25, 5))}
             onDragOver={(e) => e.preventDefault()}
             onDrop={(e) => {
               e.preventDefault();
@@ -1116,6 +1060,7 @@ function App() {
               if (e.target === e.currentTarget || e.button === 1 || e.altKey) {
                 e.preventDefault();
                 panning.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y };
+                setIsPanning(true);
                 e.currentTarget.setPointerCapture(e.pointerId);
                 if (e.target === e.currentTarget) select(null);
               }
@@ -1148,39 +1093,39 @@ function App() {
                 gesture.current = null;
               }
               panning.current = null;
+              setIsPanning(false);
             }}
             onPointerCancel={() => {
               if (gesture.current) dispatch({ type: 'preview', scene: gesture.current.scene });
               gesture.current = null;
               panning.current = null;
+              setIsPanning(false);
             }}
           >
             <div
               ref={canvas}
-              className={'canvas ' + (grid ? 'grid' : '')}
+              className="canvas"
               style={{
                 width: 2240,
                 height: 1080,
+                '--s': scale,
                 transform: `translate(-50%,-50%) translate(${pan.x}px,${pan.y}px) scale(${scale})`,
-                backgroundColor: showCanvasBg
-                  ? (scene.bgType === 'solid' ? solidColor : (previewBackground ? '#000000' : '#0c151d'))
-                  : '#0c151d',
-                backgroundImage: showCanvasBg && scene.bgType !== 'solid' && previewBackground
-                  ? `url(${previewBackground})`
-                  : undefined,
+                backgroundColor: canvasBg,
+                backgroundImage: showCanvasBg && scene.bgType !== 'solid' && previewBackground ? `url(${previewBackground})` : undefined,
                 backgroundSize: '100% 100%',
                 backgroundRepeat: 'no-repeat',
-              }}
+              } as CSSProperties}
               onPointerDown={(e) => {
                 if (e.target === e.currentTarget) select(null);
               }}
             >
+              {grid && <div className="grid-overlay" />}
               {scene.widgets
                 .filter((a) => a.visible)
                 .map((v) => (
                   <div
                     key={v.id}
-                    className={'widget-box ' + (selected === v.id ? 'selected' : '')}
+                    className={`widget-box ${selected === v.id ? 'selected' : ''} ${v.locked ? 'locked' : ''}`}
                     style={{ left: v.x, top: v.y, width: v.width, height: v.height }}
                     onPointerDown={(e) => {
                       if (e.button !== 0 || e.altKey) return;
@@ -1191,12 +1136,12 @@ function App() {
                       viewport.current!.setPointerCapture(e.pointerId);
                     }}
                   >
-                    <Preview w={previewScene.widgets.find(a => a.id === v.id)!} readings={readings} />
+                    <Preview w={previewScene.widgets.find(a => a.id === v.id)!} readings={readings} cpuTempStatus={cpuTempStatus} />
                     {selected === v.id && !v.locked && (
                       <button
                         aria-label="Resize selected widget"
                         className="resize"
-                        style={{ width: 12 / scale, height: 12 / scale }}
+                        style={{ width: 14 / scale, height: 14 / scale }}
                         onPointerDown={(e) => {
                           e.stopPropagation();
                           gesture.current = { scene, id: v.id, point: point(e.clientX, e.clientY), resize: true };
@@ -1211,159 +1156,118 @@ function App() {
             </div>
           </div>
 
-          <footer>
-            <span>{w ? `X ${w.x} · Y ${w.y} / ${w.width} × ${w.height} px` : 'No selection'}</span>
-            <span>Drag workspace to pan · Alt+drag over display</span>
+          <footer className="statusbar">
+            <span className={`status ${tone}`} role="status" title={status}><span className="dot" /><span>{status}</span></span>
+            <span className="coords">{w ? `${w.x}, ${w.y} · ${w.width} × ${w.height}` : ''}</span>
+            <span className="keys">Scroll to zoom · drag empty space to pan</span>
           </footer>
-          <div className="notice" role="status">
-            {status}
-          </div>
         </section>
 
-        <aside className="right">
-          <h2>INSPECTOR</h2>
+        <aside className="sidebar right">
           {w ? (
             <>
-              <label>
-                Name
-                <input maxLength={120} value={w.name} onChange={(e) => patch({ name: e.target.value })} />
-              </label>
-              <h3>Transform</h3>
-              <div className="fields">
-                {(['x', 'y', 'width', 'height'] as const).map((k) => (
-                  <label key={k}>
-                    {k}
-                    <input
-                      disabled={w.locked}
-                      type="number"
-                      value={w[k]}
-                      onChange={(e) => {
-                        if (Number.isFinite(e.target.valueAsNumber)) patch({ [k]: e.target.valueAsNumber });
-                      }}
-                    />
-                  </label>
-                ))}
+              <div className="inspector-head">
+                <span className="kind-badge"><Icon name={w.kind === 'Text' ? 'text' : sensorIcon(w.binding)} /></span>
+                <input aria-label="Widget name" maxLength={120} value={w.name} {...live('name')} />
+                <button className={`ghost icon-btn ${w.locked ? 'on' : ''}`} aria-label={w.locked ? 'Unlock widget' : 'Lock widget'} title={w.locked ? 'Unlock' : 'Lock'} onClick={() => patch({ locked: !w.locked })}>
+                  <Icon name={w.locked ? 'lock' : 'unlock'} />
+                </button>
               </div>
-              <label>
-                <input type="checkbox" checked={w.visible} onChange={(e) => patch({ visible: e.target.checked })} />
-                Visible
-              </label>
-              <label>
-                <input type="checkbox" checked={w.locked} onChange={(e) => patch({ locked: e.target.checked })} />
-                Locked
-              </label>
-
-              <h3>Appearance</h3>
-              <label>
-                Label Text
-                <input maxLength={500} value={w.text} onChange={(e) => patch({ text: e.target.value })} />
-              </label>
-              <label>
-                Font Family
-                <select value={w.fontFamily || 'roboto'} onChange={(e) => patch({ fontFamily: e.target.value })}>
-                  {fontFamilies.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {(() => {
-                const fam = (w.fontFamily || 'roboto').toLowerCase();
-                const isNonRoboto = fam === 'orbitron' || fam === 'bitcount-single' || fam === 'rubik-glitch';
-                const isBlack = fam === 'roboto-black';
-                return (
-                  <>
-                    <label style={{ opacity: isNonRoboto || isBlack ? 0.6 : 1 }}>
-                      <input
-                        type="checkbox"
-                        checked={isBlack ? true : Boolean(w.bold)}
-                        disabled={isNonRoboto || isBlack}
-                        onChange={(e) => patch({ bold: e.target.checked })}
-                      />
-                      Bold
+              <div className="sidebar-scroll">
+                {w.kind === 'Metric value' && (
+                  <section className="section">
+                    <h3 className="section-title">Sensor</h3>
+                    <label className="field">
+                      Shows
+                      <select value={w.binding}
+                        onChange={(e) => patch({ binding: e.target.value, text: e.target.value.toUpperCase(), value: Math.min(w.value, metricMax(e.target.value)) })}>
+                        {sensors.map(s => <option key={s.binding} value={s.binding}>{s.name} ({formatMetric(s.binding, null).unit})</option>)}
+                      </select>
                     </label>
-                    {isNonRoboto && (
-                      <small style={{ color: '#88a0b0', fontSize: '11px', display: 'block', marginTop: '-6px' }}>
-                        Hardware SoC only includes Regular weight for this font.
-                      </small>
+                    {w.binding === 'CPU temperature' ? (
+                      <p className={`note ${readings.cpu_temp == null && cpuTempStatus ? 'warn' : ''}`}>
+                        {readings.cpu_temp != null ? `Live reading: ${readings.cpu_temp} °C.` : cpuTempStatus ?? 'Waiting for the CPU temperature sensor…'}
+                      </p>
+                    ) : (
+                      <NumberField label={`Value when no reading${isNetwork(w.binding) ? ' (bytes/s)' : ''}`} value={w.value} min={0} max={metricMax(w.binding)}
+                        step={isNetwork(w.binding) ? 'any' : 1} {...numberProps('value')} />
                     )}
-                    {isBlack && (
-                      <small style={{ color: '#88a0b0', fontSize: '11px', display: 'block', marginTop: '-6px' }}>
-                        Roboto Black is ultra-heavy bold (weight 900).
-                      </small>
-                    )}
-                  </>
-                );
-              })()}
-              <label>
-                Font Size
-                <input
-                  type="number"
-                  min={12}
-                  max={200}
-                  value={w.fontSize}
-                  onChange={(e) => patch({ fontSize: Math.max(12, Math.min(200, Number(e.target.value) || 12)) })}
-                />
-              </label>
-              <label>
-                Accent Color
-                <input type="color" value={w.color} onChange={(e) => patch({ color: e.target.value })} />
-              </label>
+                  </section>
+                )}
 
-              {w.kind === 'Metric value' && (
-                <>
-                  <h3>Hardware Telemetry Binding</h3>
-                  <label>
-                    Sensor Binding
-                    <select
-                      value={w.binding}
-                      onChange={(e) =>
-                        patch({
-                          binding: e.target.value,
-                          text: e.target.value.toUpperCase(),
-                          value: Math.min(w.value, metricMax(e.target.value)),
-                        })
-                      }
-                    >
-                      {sensors.map(s => <option key={s.binding} value={s.binding}>{s.name} ({formatMetric(s.binding, null).unit})</option>)}
+                <section className="section">
+                  <h3 className="section-title">Text</h3>
+                  <label className="field">
+                    {w.kind === 'Text' ? 'Text' : 'Title'}
+                    <input maxLength={500} value={w.text} {...live('text')} />
+                  </label>
+                  <label className="field">
+                    Font
+                    <select value={w.fontFamily || 'roboto'} onChange={(e) => patch({ fontFamily: e.target.value })}>
+                      {fontFamilies.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
                     </select>
                   </label>
-                  <label>
-                    Fallback Value {isNetwork(w.binding) ? '(bytes/s)' : ''}
-                    <input
-                      type="number"
-                      min={0}
-                      max={metricMax(w.binding)}
-                      step={isNetwork(w.binding) ? 'any' : 1}
-                      value={w.value}
-                      onChange={(e) => {
-                        const value = Math.max(0, Math.min(metricMax(w.binding), Number(e.target.value) || 0));
-                        patch({ value });
-                      }}
-                    />
-                  </label>
-                </>
-              )}
+                  <div className="style-row">
+                    <button className="toggle" aria-pressed={fam === 'roboto-black' || w.bold} disabled={singleWeight || fam === 'roboto-black'} onClick={() => patch({ bold: !w.bold })} title="Bold"><b>B</b> Bold</button>
+                    <button className="toggle" aria-pressed={!singleWeight && w.italic} disabled={singleWeight} onClick={() => patch({ italic: !w.italic })} title="Italic"><i>I</i> Italic</button>
+                  </div>
+                  {singleWeight && <p className="note">The display only has the regular style of this font.</p>}
+                  <div className="fields">
+                    <NumberField label="Size" value={w.fontSize} min={12} max={200} {...numberProps('fontSize')} />
+                    <label className="field">
+                      Color
+                      <span className="color-field">
+                        <input type="color" value={w.color} aria-label="Text color" {...live('color')} />
+                        <code>{w.color}</code>
+                      </span>
+                    </label>
+                  </div>
+                </section>
 
-              <h3>Layer Actions</h3>
-              <div className="actions">
-                <button onClick={() => order(1)}>Bring Forward</button>
-                <button onClick={() => order(-1)}>Send Backward</button>
-                <button onClick={duplicate}>Duplicate</button>
-                <button disabled={w.locked} onClick={remove}>
-                  Delete
-                </button>
+                <section className="section">
+                  <h3 className="section-title">Position &amp; size</h3>
+                  <div className="fields">
+                    <NumberField label="X" value={w.x} min={0} max={2240 - w.width} disabled={w.locked} {...numberProps('x')} />
+                    <NumberField label="Y" value={w.y} min={0} max={1080 - w.height} disabled={w.locked} {...numberProps('y')} />
+                    <NumberField label="Width" value={w.width} min={40} max={2240} disabled={w.locked} {...numberProps('width')} />
+                    <NumberField label="Height" value={w.height} min={40} max={1080} disabled={w.locked} {...numberProps('height')} />
+                  </div>
+                </section>
+
+                <section className="section">
+                  <h3 className="section-title">Arrange</h3>
+                  <div className="actions">
+                    <button onClick={() => order(1)}><Icon name="up" size={14} /> Forward</button>
+                    <button onClick={() => order(-1)}><Icon name="down" size={14} /> Backward</button>
+                    <button onClick={duplicate} title="Ctrl+D"><Icon name="copy" size={14} /> Duplicate</button>
+                    <button onClick={() => patch({ visible: !w.visible })}><Icon name={w.visible ? 'eyeOff' : 'eye'} size={14} /> {w.visible ? 'Hide' : 'Show'}</button>
+                    <button className="danger" disabled={w.locked} onClick={remove} title="Delete"><Icon name="trash" size={14} /> Delete</button>
+                  </div>
+                </section>
               </div>
             </>
           ) : (
-            <div className="empty">
-              <span>⌖</span>
-              <p>Select a widget on the canvas to inspect and edit its properties</p>
+            <div className="empty-state">
+              <span className="kind-badge"><Icon name="pointer" size={20} /></span>
+              <p>Select a widget on the display to edit it.</p>
+              <div className="shortcuts">
+                <kbd>Arrows</kbd><span>Nudge (Shift ×10)</span>
+                <kbd>Ctrl D</kbd><span>Duplicate</span>
+                <kbd>Delete</kbd><span>Remove</span>
+                <kbd>Ctrl Z / Y</kbd><span>Undo / redo</span>
+                <kbd>Ctrl S</kbd><span>Save</span>
+                <kbd>Alt drag</kbd><span>Pan over widgets</span>
+              </div>
             </div>
           )}
         </aside>
       </div>
+
+      {(starting || youtubeBusy) && (
+        <div className="busy-overlay" role="alert" aria-live="assertive">
+          <div><span className="spinner large" /><p>{starting ? 'Opening your last layout…' : status}</p></div>
+        </div>
+      )}
     </div>
   );
 }
