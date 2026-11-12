@@ -1,9 +1,11 @@
+#[path = "../../../lumien-app/src-tauri/src/youtube.rs"]
+mod youtube;
 use lumien_device::{enumerate_devices, PanoramaDevice};
 use lumien_protocol::{
     encode_batch_label_update_frame, encode_brightness_frame, encode_clear_run_config_frame,
     encode_frame, encode_get_auth_frame, encode_get_device_info_frame, encode_run_config_frame,
-    parse_response_frame, GroupLabelUpdate, Label, LabelBackground, LabelGroup, LabelTextUpdate,
-    TextAlign, CANVAS_HEIGHT, CANVAS_WIDTH,
+    encode_work_config_frame, parse_response_frame, GroupLabelUpdate, Label, LabelBackground,
+    LabelGroup, LabelTextUpdate, TextAlign, CANVAS_HEIGHT, CANVAS_WIDTH,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -78,11 +80,14 @@ pub struct LayoutScene {
 fn print_usage() {
     eprintln!("Lumien CLI - TRYX Panorama SE Controller");
     eprintln!("Usage:");
+    eprintln!("  lumien-cli prepare-youtube URL YT_DLP_EXE FFMPEG_EXE   Download and convert; no USB writes");
+    eprintln!("  lumien-cli play-video PREPARED_H264_FILE               Upload, play full screen, clear overlays");
     eprintln!("  lumien-cli network                               Sample host download/upload speed (read-only, no USB)");
     eprintln!("  lumien-cli probe                                  Enumerate devices and verify handle acquisition");
     eprintln!("  lumien-cli check-prereqs                          Check running processes and communication prerequisites");
     eprintln!("  lumien-cli get-info                               Query device OS, firmware, and serial number (read-only)");
     eprintln!("  lumien-cli set-brightness <0..100>                Send a single verified brightness transaction");
+    eprintln!("  lumien-cli set-media <file_name>                  Switch active background video on display");
     eprintln!("  lumien-cli apply-widget [--dry-run] [options]     Apply one minimal supported widget to 2240x1080 canvas");
     eprintln!("         options: --x <u32> --y <u32> --text <str> --val <u32>");
     eprintln!("  lumien-cli update-text <gid> <lid> <text> [--dry] Update label text dynamically at runtime (1 Hz)");
@@ -246,6 +251,20 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "play-video" => {
+            if args.len() != 3 { eprintln!("Usage: lumien-cli play-video PREPARED_H264_FILE"); std::process::exit(1); }
+            match youtube::play(std::path::Path::new(&args[2])) {
+                Ok(name) => println!("Playback and clear-overlay ACKs received: {name}"),
+                Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+            }
+        }
+        "prepare-youtube" => {
+            if args.len() != 5 { eprintln!("Usage: lumien-cli prepare-youtube URL YT_DLP_EXE FFMPEG_EXE (offline conversion target; no USB writes)"); std::process::exit(1); }
+            match youtube::prepare(&args[2], std::path::Path::new("target/youtube"), std::path::Path::new(&args[3]), std::path::Path::new(&args[4])) {
+                Ok(path) => println!("{}", path.display()),
+                Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+            }
+        }
         "network" => {
             let mut sampler = NetworkSampler::default();
             if let Err(error) = sampler.sample() { eprintln!("Network counters unavailable: {error}"); std::process::exit(1); }
@@ -321,6 +340,20 @@ fn main() {
             send_usb_frame(&frame, "get_device_auth");
         }
 
+        "file-list" => {
+            println!("=== Lumien Query Device File List (Tag 103) ===");
+            let mut dummy_msg = Vec::with_capacity(4);
+            dummy_msg.extend_from_slice(&[0x0a, 0x02, 0x4e, 0x41]); // dummy: "NA"
+
+            let mut req_pkg = Vec::with_capacity(16);
+            req_pkg.extend_from_slice(&[0x0a, 0x02, 0x08, 0x01]); // header
+            req_pkg.extend_from_slice(&[0xba, 0x06, dummy_msg.len() as u8]); // tag 103
+            req_pkg.extend_from_slice(&dummy_msg);
+
+            let frame = lumien_protocol::encode_frame(&req_pkg);
+            send_usb_frame(&frame, "get_file_list");
+        }
+
         "set-brightness" => {
             if args.len() < 3 {
                 eprintln!("Error: brightness value (0..100) required.");
@@ -336,6 +369,79 @@ fn main() {
             println!("=== Lumien Set Brightness ===");
             let frame = encode_brightness_frame(brightness);
             send_usb_frame(&frame, &format!("set_brightness_{}", brightness));
+        }
+
+        "set-media" => {
+            if args.len() < 3 {
+                eprintln!("Error: media file name required (e.g. default_01.mp4.h264_2240x1080).");
+                std::process::exit(1);
+            }
+            let media_file = &args[2];
+            println!("=== Lumien Set Media Background ===");
+            let frame = encode_work_config_frame(media_file);
+            send_usb_frame(&frame, &format!("set_media_{}", media_file));
+        }
+
+        "set-solid-color" => {
+            if args.len() < 3 {
+                eprintln!("Error: hex color required (e.g. #000000 or #18262e).");
+                std::process::exit(1);
+            }
+            let raw_color = &args[2];
+            let clean = raw_color.trim_start_matches('#').to_ascii_lowercase();
+            let filename = format!("solid_{}.mp4.h264_2240x1080", clean);
+            println!("=== Lumien Set Solid Color Background: #{} ===", clean);
+
+            // Read solid color bytes from scratch/swatches or generate
+            let swatch_path = format!("lumien-app/src-tauri/assets/swatches/solid_{}.h264_2240x1080", clean);
+            let data = match fs::read(&swatch_path) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let alt_path = format!("scratch/swatches/solid_{}.h264_2240x1080", clean);
+                    match fs::read(&alt_path) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            eprintln!("[ERROR] Could not find swatch file: {:?}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+
+            let mut dev = match PanoramaDevice::open_first() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[ERROR] Failed to open device: {:?}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            println!("Transmitting {} ({} bytes) over USB Bulk OUT...", filename, data.len());
+            let t0 = Instant::now();
+            if let Err(e) = dev.transmit_file(&filename, &data, Duration::from_millis(2000)) {
+                eprintln!("[ERROR] Transmit failed: {:?}", e);
+                std::process::exit(1);
+            }
+            println!("Transmit complete in {:.2?}.", t0.elapsed());
+
+            println!("Activating playback via WorkConfigPb...");
+            let frame = encode_work_config_frame(&filename);
+            if let Err(e) = dev.write_frame(&frame, Duration::from_millis(2000)) {
+                eprintln!("[ERROR] Activate write failed: {:?}", e);
+                std::process::exit(1);
+            }
+            let rsp = match dev.read_frame(Duration::from_millis(2000)) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[ERROR] Activate ACK read failed: {:?}", e);
+                    std::process::exit(1);
+                }
+            };
+            let total = lumien_protocol::encode_frame(&rsp);
+            match parse_response_frame(&total) {
+                Ok(ack) if ack.ok => println!(">>> SUCCESS: Solid color #{} active on display!", clean),
+                _ => eprintln!("[WARNING] Device did not return OK for activate."),
+            }
         }
 
         "apply-widget" => {

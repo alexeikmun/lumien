@@ -1,8 +1,12 @@
 [package]
 name = "lumien-app"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 [workspace]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 [dependencies]

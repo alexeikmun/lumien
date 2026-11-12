@@ -6,20 +6,20 @@ SetCompressor /SOLID lzma
 ; General
 Name "Lumien"
 !system 'cmd.exe /c if not exist "releases\download" mkdir "releases\download"'
-OutFile "releases\download\lumien_0.1.0_x64-setup.exe"
+OutFile "releases\download\lumien_0.3.0_x64-setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Lumien"
 InstallDirRegKey HKCU "Software\Alexis\Lumien" "InstallLocation"
 RequestExecutionLevel user
 Unicode true
 
 ; Version Info
-VIProductVersion "0.1.0.0"
+VIProductVersion "0.3.0.0"
 VIAddVersionKey "ProductName" "Lumien"
 VIAddVersionKey "CompanyName" "Alexis"
 VIAddVersionKey "LegalCopyright" "Alexis"
 VIAddVersionKey "FileDescription" "Lumien Installer"
-VIAddVersionKey "FileVersion" "0.1.0.0"
-VIAddVersionKey "ProductVersion" "0.1.0"
+VIAddVersionKey "FileVersion" "0.3.0.0"
+VIAddVersionKey "ProductVersion" "0.3.0"
 
 ; Interface Settings
 !define MUI_ABORTWARNING
@@ -71,7 +71,7 @@ Section "Lumien" SecLumien
     ; Write Add/Remove Programs registry entries
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Lumien" '"$INSTDIR\lumien-app.exe" --autostart'
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lumien" "DisplayName" "Lumien"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lumien" "DisplayVersion" "0.1.0"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lumien" "DisplayVersion" "0.3.0"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lumien" "Publisher" "Alexis"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lumien" "DisplayIcon" "$INSTDIR\icon.ico"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lumien" "UninstallString" '"$INSTDIR\uninstall.exe"'

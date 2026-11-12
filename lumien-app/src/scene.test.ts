@@ -150,3 +150,31 @@ test('snap, grid, split, and bend toolbar options persist and default gracefully
   assert.equal(parsedLegacy.split, true);
   assert.equal(parsedLegacy.bend, true);
 });
+
+test('solid background color and mode persist and validate correctly', () => {
+  const scene = emptyScene();
+  scene.bgType = 'solid';
+  scene.bgColor = '#000000'; // Pure black AMOLED
+  const roundtrip = parseScene(JSON.stringify(scene));
+  assert.equal(roundtrip.bgType, 'solid');
+  assert.equal(roundtrip.bgColor, '#000000');
+
+  // Custom hex color (uppercase normalized to lowercase)
+  scene.bgColor = '#1A2127';
+  const customRoundtrip = parseScene(JSON.stringify(scene));
+  assert.equal(customRoundtrip.bgType, 'solid');
+  assert.equal(customRoundtrip.bgColor, '#1a2127');
+
+  // Invalid color falls back to #000000
+  (scene as any).bgColor = 'invalid-color';
+  const fallback = parseScene(JSON.stringify(scene));
+  assert.equal(fallback.bgColor, '#000000');
+
+  // Legacy scene without bgType/bgColor defaults to preset and #000000
+  const legacy = emptyScene();
+  delete (legacy as any).bgType;
+  delete (legacy as any).bgColor;
+  const parsedLegacy = parseScene(JSON.stringify(legacy));
+  assert.equal(parsedLegacy.bgType, 'preset');
+  assert.equal(parsedLegacy.bgColor, '#000000');
+});

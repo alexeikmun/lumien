@@ -450,6 +450,39 @@ impl PanoramaDevice {
         unsafe { CloseHandle(event) };
         res
     }
+
+    /// Transmits a media file to device eMMC via FileTransmitBegin (400) -> FileTransmitData (401) -> FileTransmitEnd (402).
+    pub fn transmit_file(&mut self, file_name: &str, data: &[u8], timeout: Duration) -> Result<(), DeviceError> {
+        let begin_frame = lumien_protocol::encode_file_transmit_begin_frame(file_name, data.len() as u32);
+        self.write_frame(&begin_frame, timeout)?;
+        let rsp = self.read_frame(timeout)?;
+        let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&rsp))?;
+        if !ack.ok {
+            return Err(DeviceError::WriteFailed(1));
+        }
+
+        const CHUNK_SIZE: usize = 65536;
+        for chunk in data.chunks(CHUNK_SIZE) {
+            let data_frame = lumien_protocol::encode_file_transmit_data_frame(chunk);
+            self.write_frame(&data_frame, timeout)?;
+            let rsp = self.read_frame(timeout)?;
+            let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&rsp))?;
+            if !ack.ok {
+                return Err(DeviceError::WriteFailed(2));
+            }
+        }
+
+        let crc = lumien_protocol::crc32c(data);
+        let end_frame = lumien_protocol::encode_file_transmit_end_frame("media", crc);
+        self.write_frame(&end_frame, timeout)?;
+        let rsp = self.read_frame(timeout)?;
+        let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&rsp))?;
+        if !ack.ok {
+            return Err(DeviceError::WriteFailed(3));
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for PanoramaDevice {
@@ -514,6 +547,42 @@ impl DisplaySession {
             mpsc::RecvTimeoutError::Timeout => DeviceError::Timeout,
             mpsc::RecvTimeoutError::Disconnected => DeviceError::ReadFailed(0),
         })?
+    }
+
+    /// Transmits a media file to device eMMC via FileTransmitBegin (400) -> FileTransmitData (401) -> FileTransmitEnd (402).
+    pub fn transmit_file(&mut self, file_name: &str, data: &[u8], timeout: Duration) -> Result<(), DeviceError> {
+        // Step 1: Begin
+        let begin_frame = lumien_protocol::encode_file_transmit_begin_frame(file_name, data.len() as u32);
+        self.write_frame(&begin_frame, timeout)?;
+        let rsp = self.read_frame(timeout)?;
+        let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&rsp))?;
+        if !ack.ok {
+            return Err(DeviceError::WriteFailed(1));
+        }
+
+        // Step 2: Data chunks (64 KB)
+        const CHUNK_SIZE: usize = 65536;
+        for chunk in data.chunks(CHUNK_SIZE) {
+            let data_frame = lumien_protocol::encode_file_transmit_data_frame(chunk);
+            self.write_frame(&data_frame, timeout)?;
+            let rsp = self.read_frame(timeout)?;
+            let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&rsp))?;
+            if !ack.ok {
+                return Err(DeviceError::WriteFailed(2));
+            }
+        }
+
+        // Step 3: End with CRC32C
+        let crc = lumien_protocol::crc32c(data);
+        let end_frame = lumien_protocol::encode_file_transmit_end_frame("media", crc);
+        self.write_frame(&end_frame, timeout)?;
+        let rsp = self.read_frame(timeout)?;
+        let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&rsp))?;
+        if !ack.ok {
+            return Err(DeviceError::WriteFailed(3));
+        }
+
+        Ok(())
     }
 }
 

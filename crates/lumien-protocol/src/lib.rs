@@ -333,6 +333,107 @@ pub fn encode_brightness_frame(brightness: u8) -> Vec<u8> {
     encode_frame(&req_pkg)
 }
 
+/// Precomputed 256-entry table for Castagnoli CRC32C (polynomial 0x82F63B78).
+const CRC32C_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0x82F63B78;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Computes IEEE standard Castagnoli CRC32C checksum (Refin=true, Refout=true, Poly=0x82F63B78).
+///
+/// Verified identical to TRYX UDB.exe native implementation at address 0x4d970.
+pub fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFFFFFFu32;
+    for &b in data {
+        crc = CRC32C_TABLE[((crc ^ (b as u32)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFFFFFF
+}
+
+/// Encodes a complete FileTransmitBeginPb frame (ReqPackagePb tag 400).
+pub fn encode_file_transmit_begin_frame(file_name: &str, file_size: u32) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(file_name.len() + 16);
+    encode_string_field(1, file_name, &mut inner);
+    encode_varint_field(2, file_size as u64, &mut inner);
+
+    let mut req_pkg = Vec::with_capacity(inner.len() + 16);
+    let header_bytes = [0x08, 0x01];
+    encode_length_delimited(1, &header_bytes, &mut req_pkg);
+    encode_length_delimited(400, &inner, &mut req_pkg);
+
+    encode_frame(&req_pkg)
+}
+
+/// Encodes a complete FileTransmitDataPb frame (ReqPackagePb tag 401).
+pub fn encode_file_transmit_data_frame(chunk: &[u8]) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(chunk.len() + 8);
+    encode_length_delimited(1, chunk, &mut inner);
+
+    let mut req_pkg = Vec::with_capacity(inner.len() + 16);
+    let header_bytes = [0x08, 0x01];
+    encode_length_delimited(1, &header_bytes, &mut req_pkg);
+    encode_length_delimited(401, &inner, &mut req_pkg);
+
+    encode_frame(&req_pkg)
+}
+
+/// Encodes a complete FileTransmitEndPb frame (ReqPackagePb tag 402) with CRC32C.
+pub fn encode_file_transmit_end_frame(file_type: &str, crc: u32) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(file_type.len() + 16);
+    encode_string_field(1, file_type, &mut inner);
+    encode_varint_field(2, crc as u64, &mut inner);
+
+    let mut req_pkg = Vec::with_capacity(inner.len() + 16);
+    let header_bytes = [0x08, 0x01];
+    encode_length_delimited(1, &header_bytes, &mut req_pkg);
+    encode_length_delimited(402, &inner, &mut req_pkg);
+
+    encode_frame(&req_pkg)
+}
+
+/// Encodes a complete WorkConfigPb frame (ReqPackagePb tag 200 -> tag 3)
+/// to switch active background media playback on the device.
+pub fn encode_work_config_frame(media_file: &str) -> Vec<u8> {
+    // WorkConfigPb:
+    // field 1 (media_mode) = 0 (MediaMode_Single)
+    // field 2 (loop_mode) = 0 (LoopMode_Single)
+    // field 3 (single_mode_media_file) = media_file
+    let mut work_cfg = Vec::with_capacity(media_file.len() + 16);
+    encode_varint_field(1, 0, &mut work_cfg);
+    encode_varint_field(2, 0, &mut work_cfg);
+    encode_string_field(3, media_file, &mut work_cfg);
+
+    // UserConfigPb:
+    // field 3 (work_config) = work_cfg
+    let mut user_cfg = Vec::with_capacity(work_cfg.len() + 8);
+    encode_length_delimited(3, &work_cfg, &mut user_cfg);
+
+    // ReqPackagePb:
+    // field 1 (header) = HeaderPb { version: 1 }
+    // field 200 (user_config) = user_cfg
+    let mut req_pkg = Vec::with_capacity(user_cfg.len() + 16);
+    let header_bytes = [0x08, 0x01];
+    encode_length_delimited(1, &header_bytes, &mut req_pkg);
+    encode_length_delimited(200, &user_cfg, &mut req_pkg);
+
+    encode_frame(&req_pkg)
+}
+
 /// Encodes a complete 19-byte get_device_info query frame.
 ///
 /// Wraps:
@@ -488,6 +589,36 @@ pub fn parse_device_response(frame_bytes: &[u8]) -> Result<DeviceResponse, Proto
                 let end = offset + len as usize;
                 if payload[offset..end] == [0x0a, 0x02, b'o', b'k'] {
                     ok = true;
+                }
+                offset = end;
+            }
+            (800, 2) | (801, 2) | (802, 2) => {
+                // FileTransmitStatusPb / FileTransmitDataStatusPb / FileTransmitEndStatusPb:
+                // field 1 (file_trans_status) varint: 0 = OK, 1 = SpaceNotEnough, 2 = FileError, 3 = CRCFail
+                let (len, new_offset) = decode_varint(payload, offset)?;
+                offset = new_offset;
+                let end = offset + len as usize;
+                let mut status = 0u32;
+                let mut s_off = offset;
+                while s_off < end {
+                    let (s_tag, next_s) = decode_varint(payload, s_off)?;
+                    s_off = next_s;
+                    if (s_tag >> 3) == 1 && (s_tag & 7) == 0 {
+                        let (s_val, next_v) = decode_varint(payload, s_off)?;
+                        status = s_val as u32;
+                        s_off = next_v;
+                    }
+                }
+                if status == 0 {
+                    ok = true;
+                } else {
+                    ok = false;
+                    err_code = match status {
+                        1 => "SpaceNotEnough".to_string(),
+                        2 => "FileError".to_string(),
+                        3 => "CRCFail".to_string(),
+                        n => format!("FileTransStatus_{}", n),
+                    };
                 }
                 offset = end;
             }
@@ -759,6 +890,57 @@ mod tests {
                 0x08, 0x66,             // label_id = 102
                 0x12, 0x02, 0x34, 0x35  // text = "45"
             ]
+        );
+    }
+
+    #[test]
+    fn test_encode_work_config_frame() {
+        let frame = encode_work_config_frame("default_01.mp4.h264_2240x1080");
+        assert_eq!(&frame[0..4], b"TRYX");
+        // header (4 bytes) + field 200 (user_config)
+        assert_eq!(&frame[8..12], &[0x0a, 0x02, 0x08, 0x01]);
+        // field 200 tag (c2 0c)
+        assert_eq!(&frame[12..14], &[0xc2, 0x0c]);
+    }
+
+    #[test]
+    fn test_crc32c_standard_vectors() {
+        assert_eq!(crc32c(b"123456789"), 0xe3069283);
+        assert_eq!(crc32c(b""), 0x00000000);
+    }
+
+    #[test]
+    fn test_file_transmit_framing_and_response() {
+        let begin = encode_file_transmit_begin_frame("test.h264", 1024);
+        assert_eq!(&begin[0..4], b"TRYX");
+        // Tag 400 varint is (400 << 3) | 2 = 3202 = 0x82, 0x19
+        assert_eq!(&begin[12..14], &[0x82, 0x19]);
+
+        let data = encode_file_transmit_data_frame(&[1, 2, 3, 4]);
+        assert_eq!(&data[0..4], b"TRYX");
+        // Tag 401 varint is (401 << 3) | 2 = 3210 = 0x8a, 0x19
+        assert_eq!(&data[12..14], &[0x8a, 0x19]);
+
+        let end = encode_file_transmit_end_frame("media", 0x12345678);
+        assert_eq!(&end[0..4], b"TRYX");
+        // Tag 402 varint is (402 << 3) | 2 = 3218 = 0x92, 0x19
+        assert_eq!(&end[12..14], &[0x92, 0x19]);
+
+        // Verify status ACK decoding for tag 800/801/802
+        let ack_800 = [
+            0x54, 0x52, 0x59, 0x58, 0x09, 0x00, 0x00, 0x00, 0x0a, 0x02, 0x08, 0x01, 0x12, 0x00,
+            0x82, 0x32, 0x00,
+        ];
+        let res = parse_response_frame(&ack_800).expect("valid tag 800 ack");
+        assert!(res.ok);
+
+        let err_802 = [
+            0x54, 0x52, 0x59, 0x58, 0x0b, 0x00, 0x00, 0x00, 0x0a, 0x02, 0x08, 0x01, 0x12, 0x00,
+            0x92, 0x32, 0x02, 0x08, 0x03,
+        ];
+        assert_eq!(
+            parse_device_response(&err_802),
+            Ok(DeviceResponse::Error { code: "CRCFail".to_string(), why: "".to_string() })
         );
     }
 }

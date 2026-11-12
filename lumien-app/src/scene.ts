@@ -45,6 +45,9 @@ export type Scene = {
   snap: boolean;
   split: boolean;
   bend: boolean;
+  bgType?: 'preset' | 'solid';
+  bgColor?: string;
+  bgFile?: string;
 };
 export const profile = { division: 1120, bend: [1060, 1180] };
 export const emptyScene = (): Scene => ({
@@ -57,6 +60,8 @@ export const emptyScene = (): Scene => ({
   snap: false,
   split: true,
   bend: true,
+  bgType: 'preset',
+  bgColor: '#000000',
 });
 export function geometry(w: Widget): Widget {
   const width = Math.max(40, Math.min(2240, Math.round(w.width))),
@@ -150,6 +155,12 @@ export function parseScene(text: string): Scene {
   if (typeof s.snap !== 'boolean') s.snap = false;
   if (typeof s.split !== 'boolean') s.split = typeof (s as any).division === 'boolean' ? (s as any).division : true;
   if (typeof s.bend !== 'boolean') s.bend = true;
+  if (s.bgType !== 'solid') s.bgType = 'preset';
+  if (typeof s.bgColor !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(s.bgColor)) s.bgColor = '#000000';
+  else s.bgColor = s.bgColor.toLowerCase();
+  if (s.bgFile !== undefined && (typeof s.bgFile !== 'string' || s.bgFile.length > 255 || !s.bgFile.endsWith('.mp4.h264_2240x1080') || /[\\/\x00-\x1f]/.test(s.bgFile))) {
+    throw Error('Invalid background media file');
+  }
   const ids = new Set();
   for (const w of s.widgets) {
     if (!w || !kinds.includes(w.kind) || typeof w.id !== 'string' || ids.has(w.id)) throw Error('Invalid widget ID/type');

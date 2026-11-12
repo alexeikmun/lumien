@@ -1,6 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod layout_files;
+mod cpu_temperature;
+mod youtube;
+mod video_gallery;
+mod presets;
+use presets::PresetItem;
 use lumien_telemetry::{NetworkSampler, NetworkRates, format_metric, is_network};
 
 use lumien_device::{enumerate_devices, DisplaySession};
@@ -300,6 +305,18 @@ struct LayoutScene {
     width: u32,
     height: u32,
     widgets: Vec<LayoutWidget>,
+    #[serde(default = "default_bg_type", rename = "bgType", alias = "bg_type")]
+    bg_type: String,
+    #[serde(default = "default_bg_color", rename = "bgColor", alias = "bg_color")]
+    bg_color: String,
+}
+
+fn default_bg_type() -> String {
+    "preset".to_string()
+}
+
+fn default_bg_color() -> String {
+    "#000000".to_string()
 }
 
 fn parse_hex_color(hex: &str) -> u32 {
@@ -352,7 +369,7 @@ fn get_telemetry() -> Result<HashMap<String, Option<f64>>, String> {
     let (gpu_temp, gpu_load) = read_gpu_telemetry();
 
     map.insert("cpu_load".to_string(), Some(cpu_load as f64));
-    map.insert("cpu_temp".to_string(), Some((40 + (cpu_load / 4)) as f64));
+    map.insert("cpu_temp".to_string(), cpu_temperature::read());
     map.insert("ram".to_string(), Some(ram_load as f64));
     map.insert("gpu_load".to_string(), Some(gpu_load as f64));
     map.insert("gpu_temp".to_string(), Some(gpu_temp as f64));
@@ -418,6 +435,192 @@ fn clear_display() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn list_presets(app: tauri::AppHandle) -> Result<Vec<PresetItem>, String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    Ok(presets::get_all_presets(&config_dir))
+}
+
+#[tauri::command]
+fn import_kanali_presets(app: tauri::AppHandle) -> Result<Vec<PresetItem>, String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    presets::scan_and_import_kanali(&config_dir)
+}
+
+#[tauri::command]
+fn get_active_preset(app: tauri::AppHandle) -> Result<String, String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    Ok(presets::load_active_preset(&config_dir))
+}
+
+
+
+#[tauri::command]
+async fn list_downloaded_videos(app: tauri::AppHandle) -> Result<Vec<video_gallery::Video>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = app.path().app_config_dir().map_err(|e| e.to_string())?;
+        video_gallery::list(&config.join("youtube"), presets::find_ffmpeg(&config).as_deref())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn play_downloaded_video(app: tauri::AppHandle, id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = app.path().app_config_dir().map_err(|e| e.to_string())?;
+        let path = video_gallery::resolve(&config.join("youtube"), &id)?;
+        ensure_usb_channel_available()?;
+        let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
+        drop(worker.take());
+        let filename = youtube::play(&path)?;
+        presets::save_active_preset(&config, &filename)?;
+        log_usb("INFO", &format!("Gallery playback acknowledged: {filename}"));
+        Ok("Saved video playing full screen. Apply your layout to restore widgets.".into())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn remove_downloaded_video(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = app.path().app_config_dir().map_err(|e| e.to_string())?;
+        video_gallery::remove(&config.join("youtube"), &id)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn play_youtube(app: tauri::AppHandle, url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        static IMPORT: Mutex<()> = Mutex::new(());
+        let _import = IMPORT.try_lock().map_err(|_| "A YouTube import is already running")?;
+        let config = app.path().app_config_dir().map_err(|e| e.to_string())?;
+        youtube::video_id(&url)?;
+        let downloader = presets::find_tool("yt-dlp.exe", &config)?;
+        let ffmpeg = presets::find_ffmpeg(&config).ok_or("FFmpeg is required to convert YouTube videos")?;
+        let path = youtube::prepare(&url, &config.join("youtube"), &downloader, &ffmpeg)?;
+        ensure_usb_channel_available()?;
+        let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
+        drop(worker.take());
+        let filename = youtube::play(&path)?;
+        presets::save_active_preset(&config, &filename)?;
+        log_usb("INFO", &format!("YouTube playback acknowledged: {filename}; overlays cleared"));
+        Ok("YouTube video playing full screen. Apply your layout to restore widgets.".into())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn set_display_background(app: tauri::AppHandle, file_name: String) -> Result<String, String> {
+    if file_name.len() > 255 || !file_name.ends_with(".mp4.h264_2240x1080")
+        || file_name.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+        return Err("Invalid background media file".into());
+    }
+    ensure_usb_channel_available()?;
+    log_usb("INFO", &format!("Executing set_display_background: {}", file_name));
+
+    let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
+    drop(worker.take());
+
+    let frame = lumien_protocol::encode_work_config_frame(&file_name);
+    let mut dev = match DisplaySession::open_first() {
+        Ok(d) => {
+            log_usb("INFO", "Device opened for set_display_background.");
+            d
+        }
+        Err(e) => {
+            log_usb("ERROR", &format!("open_first failed during set_display_background: {:?}", e));
+            return Err(format!("Failed to open device: {:?}", e));
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    if let Err(e) = dev.write_frame(&frame, Duration::from_millis(2000)) {
+        log_usb("ERROR", &format!("Bulk OUT work_config frame failed: {:?}", e));
+        return Err(format!("Write failed: {:?}", e));
+    }
+    log_usb("WRITE", &format!("WorkConfig frame ({} bytes) in {:?}", frame.len(), t0.elapsed()));
+
+    let t1 = std::time::Instant::now();
+    let payload = match dev.read_frame(Duration::from_millis(2000)) {
+        Ok(p) => {
+            let prev = hex_preview(&p[..std::cmp::min(16, p.len())]);
+            log_usb("READ", &format!("WorkConfig ACK ({} bytes) in {:?} | Hex: {}", p.len(), t1.elapsed(), prev));
+            p
+        }
+        Err(e) => {
+            log_usb("ERROR", &format!("Bulk IN WorkConfig ACK failed: {:?}", e));
+            return Err(format!("Read failed: {:?}", e));
+        }
+    };
+
+    let total = lumien_protocol::encode_frame(&payload);
+    let ack = parse_response_frame(&total)
+        .map_err(|e| format!("Invalid ACK: {:?}", e))?;
+
+    if ack.ok {
+        log_usb("INFO", "Background media switched successfully.");
+        if let Ok(config_dir) = app.path().app_config_dir() {
+            let _ = presets::save_active_preset(&config_dir, &file_name);
+        }
+        Ok(format!("Background set to {}", file_name))
+    } else {
+        log_usb("WARN", "Device rejected work config command.");
+        Err("Device rejected work config command.".to_string())
+    }
+}
+
+#[tauri::command]
+fn set_solid_color_background(app: tauri::AppHandle, color: String) -> Result<String, String> {
+    ensure_usb_channel_available()?;
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let (file_name, data) = presets::get_or_create_solid_color_video(&config_dir, &color)?;
+
+    log_usb("INFO", &format!("Executing set_solid_color_background: {} ({} bytes)", file_name, data.len()));
+
+    let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
+    drop(worker.take());
+
+    let mut dev = match DisplaySession::open_first() {
+        Ok(d) => {
+            log_usb("INFO", "Device opened for set_solid_color_background.");
+            d
+        }
+        Err(e) => {
+            log_usb("ERROR", &format!("open_first failed during set_solid_color_background: {:?}", e));
+            return Err(format!("Failed to open device: {:?}", e));
+        }
+    };
+
+    // 1. Transmit file to device eMMC
+    let t0 = std::time::Instant::now();
+    dev.transmit_file(&file_name, &data, Duration::from_millis(2000))
+        .map_err(|e| {
+            log_usb("ERROR", &format!("Transmit solid background failed: {:?}", e));
+            format!("Transmit solid background failed: {:?}", e)
+        })?;
+    log_usb("WRITE", &format!("Transmitted {} ({} bytes) in {:?}", file_name, data.len(), t0.elapsed()));
+
+    // 2. Activate playback context via WorkConfigPb
+    let frame = lumien_protocol::encode_work_config_frame(&file_name);
+    let t1 = std::time::Instant::now();
+    dev.write_frame(&frame, Duration::from_millis(2000))
+        .map_err(|e| format!("Activate work_config failed: {:?}", e))?;
+
+    let payload = dev.read_frame(Duration::from_millis(2000))
+        .map_err(|e| format!("Read work_config ACK failed: {:?}", e))?;
+    log_usb("WRITE", &format!("WorkConfig frame in {:?}", t1.elapsed()));
+
+    let total = lumien_protocol::encode_frame(&payload);
+    let ack = parse_response_frame(&total)
+        .map_err(|e| format!("Invalid ACK: {:?}", e))?;
+
+    if ack.ok {
+        log_usb("INFO", &format!("Solid color background ({}) activated successfully.", color));
+        let _ = presets::save_active_preset(&config_dir, &file_name);
+        Ok(format!("Solid background ({}) activated on display.", color))
+    } else {
+        log_usb("WARN", "Device rejected work config command.");
+        Err("Device rejected work config command.".to_string())
+    }
+}
+
+#[tauri::command]
 fn apply_scene(scene_json: String) -> Result<String, String> {
     ensure_usb_channel_available()?;
 
@@ -444,7 +647,8 @@ fn apply_scene(scene_json: String) -> Result<String, String> {
             return Err("Invalid metric fallback value".into());
         }
         if w.kind == "Metric value" {
-            let (value_text, unit) = format_metric(&w.binding, Some(w.value));
+            let value = if w.binding == "CPU temperature" { cpu_temperature::read() } else { Some(w.value) };
+            let (value_text, unit) = format_metric(&w.binding, value);
             let val_size = ((w.font_size as f32 * 1.65).round() as u32).clamp(16, 220);
             let unit_size = ((val_size as f32 * 0.65).round() as u32).clamp(12, 140);
             let title_size = ((w.font_size as f32 * 0.45).round() as u32).clamp(14, 60);
@@ -606,7 +810,7 @@ fn apply_scene(scene_json: String) -> Result<String, String> {
                 for b in &bindings {
                     let value = match b.sensor.as_str() {
                         "CPU load" => Some(cpu as f64),
-                        "CPU temperature" => Some((40 + (cpu / 4)) as f64),
+                        "CPU temperature" => cpu_temperature::read(),
                         "GPU load" => Some(gpu_load as f64),
                         "GPU temperature" => Some(gpu_temp as f64),
                         "Memory usage" => Some(ram as f64),
@@ -682,14 +886,35 @@ fn is_autostart_launch(args: impl IntoIterator<Item = String>) -> bool {
 }
 
 fn ensure_autostart_registered() {
-    // ponytail: register in HKCU Run key with --autostart so Windows starts Lumien in background
-    if let Ok(exe) = std::env::current_exe() {
+    // Only register release / production builds to autostart, never debug development builds
+    #[cfg(not(debug_assertions))]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            use std::os::windows::process::CommandExt;
+            let val = format!("\"{}\" --autostart", exe.display());
+            let _ = std::process::Command::new("reg")
+                .args(["add", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "Lumien", "/t", "REG_SZ", "/d", &val, "/f"])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .status();
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        // In debug builds, remove any stale debug registration from registry so Windows boot doesn't launch unhosted debug binaries
         use std::os::windows::process::CommandExt;
-        let val = format!("\"{}\" --autostart", exe.display());
-        let _ = std::process::Command::new("reg")
-            .args(["add", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "Lumien", "/t", "REG_SZ", "/d", &val, "/f"])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .status();
+        if let Ok(output) = std::process::Command::new("reg")
+            .args(["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "Lumien"])
+            .creation_flags(0x08000000)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if text.contains("target\\debug") {
+                let _ = std::process::Command::new("reg")
+                    .args(["delete", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "Lumien", "/f"])
+                    .creation_flags(0x08000000)
+                    .status();
+            }
+        }
     }
 }
 
@@ -765,14 +990,24 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            layout_files::open_layout,
+            layout_files::list_layouts,
+            layout_files::load_layout,
             layout_files::save_layout,
             layout_files::restore_layout,
             layout_files::remember_layout,
             get_device_status,
             get_telemetry,
             apply_scene,
-            clear_display
+            clear_display,
+            list_presets,
+            import_kanali_presets,
+            get_active_preset,
+            set_display_background,
+            play_youtube,
+            list_downloaded_videos,
+            play_downloaded_video,
+            remove_downloaded_video,
+            set_solid_color_background
         ])
         .run(tauri::generate_context!())
         .expect("Lumien startup failed");

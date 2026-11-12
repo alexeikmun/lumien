@@ -1,12 +1,12 @@
 {
   "name": "lumien-app",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc --noEmit && vite build",
-    "build:installer": "powershell -ExecutionPolicy Bypass -File ../scripts/build-installer.ps1",
+    "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/build-installer.ps1",
     "test": "node --experimental-strip-types --test src/scene.test.ts",
     "tauri": "tauri"
   },

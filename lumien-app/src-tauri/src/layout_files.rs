@@ -10,6 +10,21 @@ pub struct LayoutFiles(Mutex<HashSet<PathBuf>>);
 #[derive(Serialize)]
 pub struct OpenedLayout { path: String, content: String }
 
+#[derive(Serialize)]
+pub struct LayoutOption { path: String, name: String }
+
+fn register(app: &tauri::AppHandle, files: &LayoutFiles, path: &Path) -> Result<(), String> {
+    let mut known = files.0.lock().map_err(|_| "Layout file lock failed")?;
+    known.insert(path.to_path_buf());
+    let directory = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&directory).map_err(|e| format!("Cannot create layout settings: {e}"))?;
+    let catalog = directory.join("layout-catalog.json");
+    let mut paths: HashSet<PathBuf> = fs::read_to_string(&catalog).ok()
+        .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    paths.extend(known.iter().cloned());
+    atomic_write(&catalog, &serde_json::to_string(&paths).map_err(|e| e.to_string())?)
+}
+
 fn read_layout(path: &Path) -> Result<OpenedLayout, String> {
     let mut content = String::new();
     fs::File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?.take((MAX_BYTES + 1) as u64)
@@ -36,7 +51,7 @@ pub fn restore_layout(app: tauri::AppHandle, files: tauri::State<'_, LayoutFiles
     let config = app.path().app_config_dir().map_err(|e| e.to_string())?.join("recent-layout.json");
     let layout = read_recent(&config)?;
     if let Some(layout) = &layout {
-        files.0.lock().map_err(|_| "Layout file lock failed")?.insert(PathBuf::from(&layout.path));
+        register(&app, &files, Path::new(&layout.path))?;
     }
     Ok(layout)
 }
@@ -45,11 +60,40 @@ pub fn restore_layout(app: tauri::AppHandle, files: tauri::State<'_, LayoutFiles
 pub fn remember_layout(app: tauri::AppHandle, files: tauri::State<'_, LayoutFiles>, path: String) -> Result<(), String> {
     let path = PathBuf::from(path);
     if !files.0.lock().map_err(|_| "Layout file lock failed")?.contains(&path) {
-        return Err("Only a saved or opened layout can be remembered".into());
+        return Err("Only a saved layout can be remembered".into());
     }
     let directory = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&directory).map_err(|e| format!("Cannot create layout settings: {e}"))?;
-    atomic_write(&directory.join("recent-layout.json"), &serde_json::to_string(&path).map_err(|e| e.to_string())?)
+    atomic_write(&directory.join("recent-layout.json"), &serde_json::to_string(&path).map_err(|e| e.to_string())?)?;
+    register(&app, &files, &path)
+}
+
+#[tauri::command]
+pub fn list_layouts(app: tauri::AppHandle, files: tauri::State<'_, LayoutFiles>) -> Result<Vec<LayoutOption>, String> {
+    let directory = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let catalog = directory.join("layout-catalog.json");
+    let mut paths: HashSet<PathBuf> = fs::read_to_string(catalog).ok()
+        .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    paths.extend(files.0.lock().map_err(|_| "Layout file lock failed")?.iter().cloned());
+    if let Ok(Some(recent)) = read_recent(&directory.join("recent-layout.json")) {
+        paths.insert(PathBuf::from(recent.path));
+    }
+    let mut layouts: Vec<_> = paths.into_iter().filter_map(|path| {
+        let layout = read_layout(&path).ok()?;
+        let value = validate(layout.content.trim_start_matches('\u{feff}')).ok()?;
+        Some(LayoutOption { path: layout.path, name: value["name"].as_str()?.to_string() })
+    }).collect();
+    layouts.sort_by(|a,b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.path.cmp(&b.path)));
+    Ok(layouts)
+}
+
+#[tauri::command]
+pub fn load_layout(path: String, files: tauri::State<'_, LayoutFiles>) -> Result<OpenedLayout, String> {
+    let path = PathBuf::from(path);
+    if !files.0.lock().map_err(|_| "Layout file lock failed")?.contains(&path) {
+        return Err("Choose a layout from the saved layouts list".into());
+    }
+    read_layout(&path)
 }
 
 fn validate(content: &str) -> Result<serde_json::Value, String> {
@@ -59,6 +103,12 @@ fn validate(content: &str) -> Result<serde_json::Value, String> {
         || !value["name"].is_string() || !value["widgets"].is_array()
         || value["widgets"].as_array().unwrap().len() > 100 {
         return Err("Unsupported layout document".into());
+    }
+    if let Some(file) = value.get("bgFile") {
+        let valid = file.as_str().is_some_and(|name| name.len() <= 255
+            && name.ends_with(".mp4.h264_2240x1080")
+            && !name.chars().any(|c| c.is_control() || c == '/' || c == '\\'));
+        if !valid { return Err("Invalid background media file".into()); }
     }
     Ok(value)
 }
@@ -79,24 +129,13 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn open_layout(window: tauri::WebviewWindow, files: tauri::State<'_, LayoutFiles>) -> Result<Option<OpenedLayout>, String> {
-    let selected = tauri::async_runtime::spawn_blocking(move || window.dialog().file()
-        .set_parent(&window).set_title("Open Lumien layout").add_filter("Lumien layout", &["json"]).blocking_pick_file())
-        .await.map_err(|e| e.to_string())?;
-    let Some(selected) = selected else { return Ok(None) };
-    let path = selected.into_path().map_err(|e| e.to_string())?;
-    let layout = read_layout(&path)?;
-    files.0.lock().map_err(|_| "Layout file lock failed")?.insert(path.clone());
-    Ok(Some(layout))
-}
-
-#[tauri::command]
 pub async fn save_layout(window: tauri::WebviewWindow, files: tauri::State<'_, LayoutFiles>, content: String, path: Option<String>) -> Result<Option<String>, String> {
+    let app = window.app_handle().clone();
     let value = validate(&content)?;
     let path = if let Some(path) = path {
         let path = PathBuf::from(path);
         if !files.0.lock().map_err(|_| "Layout file lock failed")?.contains(&path) {
-            return Err("Choose a layout using Open or Save before overwriting it".into());
+            return Err("Choose a saved layout before overwriting it".into());
         }
         path
     } else {
@@ -111,7 +150,7 @@ pub async fn save_layout(window: tauri::WebviewWindow, files: tauri::State<'_, L
         path
     };
     atomic_write(&path, &serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?)?;
-    files.0.lock().map_err(|_| "Layout file lock failed")?.insert(path.clone());
+    register(&app, &files, &path)?;
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 

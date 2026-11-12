@@ -24,6 +24,8 @@ export function historyReducer(state: History, action: Action): History {
 // Live readings are preview/apply data; the saved fallback values stay in the document.
 export function withTelemetry(scene: Scene, readings: Record<string, number | null>): Scene {
   return { ...scene, widgets: scene.widgets.map(w => {
+    // CPU temperature is read directly in the preview and by the native LCD worker.
+    if (w.binding === 'CPU temperature') return w;
     const key = sensors.find(s => s.binding === w.binding)?.key;
     const value = key ? readings[key] : null;
     return w.kind === 'Metric value' && typeof value === 'number' && Number.isFinite(value) ? { ...w, value } : w;
