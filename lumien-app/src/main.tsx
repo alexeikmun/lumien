@@ -1,4 +1,9 @@
-import { useRef, useState, useEffect, useReducer, type CSSProperties } from 'react';
+import { useRef, useState, useEffect, useMemo, useReducer, type CSSProperties } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import coolingDelivery from './assets/presets/default_01.png';
+import migration from './assets/presets/default_02.png';
+import quantumTimeCapsule from './assets/presets/default_03.png';
+import exoEcologies from './assets/presets/default_04.png';
 import { createRoot } from 'react-dom/client';
 import {
   sample,
@@ -95,6 +100,19 @@ export type PresetItem = {
   is_active: boolean;
 };
 
+const builtinThumbnails = new Map([
+  ['default_01.mp4.h264_2240x1080', coolingDelivery],
+  ['default_02.mp4.h264_2240x1080', migration],
+  ['default_03.mp4.h264_2240x1080', quantumTimeCapsule],
+  ['default_04.mp4.h264_2240x1080', exoEcologies],
+]);
+
+function withPresetThumbnails(items: PresetItem[]) {
+  return items.map(item => ({
+    ...item, thumbnail: builtinThumbnails.get(item.file_name) ?? item.thumbnail,
+  }));
+}
+
 const SOLID_SWATCHES = [
   { name: 'Pure Black', hex: '#000000', note: 'AMOLED Off' },
   { name: 'Charcoal', hex: '#0c151d', note: 'Lumien Slate' },
@@ -153,6 +171,7 @@ function withBackgroundFile(layout: Scene, filename: string): Scene {
 
 function App() {
   const desktop = '__TAURI_INTERNALS__' in window;
+  const [editorActive, setEditorActive] = useState(false);
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [youtubeBusy, setYoutubeBusy] = useState(false);
   const [downloadedVideos, setDownloadedVideos] = useState<DownloadedVideo[]>([]);
@@ -222,10 +241,15 @@ function App() {
     panning = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
 
   const selection = scene.widgets.filter(v => selected.has(v.id));
+  const sceneJson = useMemo(() => JSON.stringify(scene), [scene]);
+  const sensorSignature = useMemo(() => sensors.map(s => Number(scene.widgets.some(
+    w => w.visible && w.kind === 'Metric value' && w.binding === s.binding,
+  ))).join(''), [scene.widgets]);
+  const pollDeviceStatus = !desktop || editorActive || (!starting && startupApply.current !== null);
   const w = selection.length === 1 ? selection[0] : undefined,
     scale = fit * zoom,
-    dirty = !starting && saved !== JSON.stringify(scene),
-    previewScene = withTelemetry(scene, readings),
+    dirty = !starting && saved !== sceneJson,
+    previewScene = useMemo(() => withTelemetry(scene, readings), [scene, readings]),
     grid = scene.grid ?? true,
     snap = scene.snap ?? false,
     division = scene.split ?? true,
@@ -243,6 +267,9 @@ function App() {
         if (file || activeFile) {
           const layout = file ? parseScene(file.content) : sample();
           const restored = activeFile ? withBackgroundFile(layout, activeFile) : layout;
+          if (file && restored.widgets.some(w => w.visible && w.kind === 'Metric value' && w.binding === 'CPU temperature')) {
+            void invoke('warm_cpu_temperature').catch(() => {});
+          }
           if (file) replaceDocument(restored, file.path, false);
           else dispatch({ type: 'replace', scene: restored });
           startupApply.current = restored;
@@ -273,7 +300,7 @@ function App() {
     if (!desktop) return;
     setPresetsLoading(true);
     invoke<PresetItem[]>('list_presets')
-      .then(setPresets)
+      .then(items => setPresets(withPresetThumbnails(items)))
       .catch((err) => setStatus('Could not load background presets: ' + String(err)))
       .finally(() => setPresetsLoading(false));
   }, [desktop]);
@@ -312,7 +339,7 @@ function App() {
     setImporting(true);
     setStatus('Importing presets from KANALI…');
     try {
-      const list = await invoke<PresetItem[]>('import_kanali_presets');
+      const list = withPresetThumbnails(await invoke<PresetItem[]>('import_kanali_presets'));
       setPresets(list);
       const active = list.find((p) => p.is_active);
       if (active) {
@@ -500,42 +527,69 @@ function App() {
     return () => r.disconnect();
   }, []);
 
-  // Poll device connection status
   useEffect(() => {
+    if (!desktop) return;
     let active = true;
-    const check = async () => {
-      const s = await device.getStatus();
-      if (active) setDeviceState(s);
+    let request = 0;
+    const refresh = async () => {
+      const id = ++request;
+      const shown = await invoke<boolean>('editor_active').catch(() => false);
+      if (active && id === request) setEditorActive(shown);
     };
-    check();
-    const id = setInterval(check, 3000);
+    const subscription = listen('editor-activity-changed', () => void refresh());
+    void subscription.then(refresh, refresh);
     return () => {
       active = false;
-      clearInterval(id);
+      void subscription.then(unlisten => unlisten(), () => {});
     };
-  }, []);
+  }, [desktop]);
 
-  // Poll live hardware telemetry
+  // Hidden sign-in launches still need to find the display while a restore is pending.
   useEffect(() => {
+    if (!pollDeviceStatus) return;
     let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      const s = await device.getStatus();
+      if (!active) return;
+      setDeviceState(previous => previous.connected === s.connected && previous.message === s.message ? previous : s);
+      if (desktop) timer = setTimeout(check, 3000);
+    };
+    void check();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [desktop, pollDeviceStatus]);
+
+  useEffect(() => {
+    if (!editorActive) return;
+    const keys = sensors.filter((_, index) => sensorSignature[index] === '1').map(s => s.key);
+    if (!keys.length) {
+      setReadings(previous => Object.keys(previous).length ? {} : previous);
+      setCpuTempStatus(null);
+      return;
+    }
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
-      if (!desktop) return;
       try {
-        const [telemetry, tempStatus] = await Promise.all([device.getTelemetry(), device.getCpuTemperatureStatus()]);
-        if (!active || Object.keys(telemetry).length === 0) return;
-        setReadings(telemetry);
+        const { readings: telemetry, cpuTempStatus: tempStatus } = await device.getTelemetry(keys);
+        if (!active) return;
+        setReadings(previous => Object.keys(previous).length === keys.length
+          && keys.every(key => previous[key] === telemetry[key]) ? previous : telemetry);
         setCpuTempStatus(tempStatus);
       } catch {
         // telemetry is best effort; widgets fall back to their saved values
       }
+      if (active) timer = setTimeout(poll, 1500);
     };
     void poll();
-    const id = setInterval(poll, 1500);
     return () => {
       active = false;
-      clearInterval(id);
+      clearTimeout(timer);
     };
-  }, [desktop]);
+  }, [editorActive, sensorSignature]);
 
   function commit(next: Scene) {
     dispatch({ type: 'commit', scene: next });

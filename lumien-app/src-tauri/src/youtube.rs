@@ -1,6 +1,11 @@
 //! YouTube is downloaded and transcoded locally; the LCD plays an elementary stream.
-use std::{fs, path::{Path, PathBuf}, process::{Command, Stdio}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{fs, path::{Path, PathBuf}, process::{Command, Stdio}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
+
+extern "system" {
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+}
 
 pub fn video_id(link: &str) -> Result<String, String> {
     let url = link.trim().strip_prefix("https://").ok_or("Use an HTTPS YouTube video link")?;
@@ -22,24 +27,59 @@ pub fn video_id(link: &str) -> Result<String, String> {
 
 
 fn run(command: &mut Command, dir: &Path, stage: &str) -> Result<(), String> {
+    run_with_timeout(command, dir, stage, 600_000)
+}
+
+fn run_with_timeout(command: &mut Command, dir: &Path, stage: &str, timeout_ms: u32) -> Result<(), String> {
     let error_path = dir.join("process-error.txt");
     let error = fs::File::create(&error_path).map_err(|e| e.to_string())?;
     let mut child = command.stdin(Stdio::null()).stderr(error).creation_flags(0x08000000)
         .spawn().map_err(|e| format!("{stage}: {e}"))?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) if status.success() => return Ok(()),
-            Some(_) => {
-                let detail = fs::read_to_string(&error_path).unwrap_or_default();
-                return Err(format!("{stage} failed: {}", detail.chars().rev().take(1500).collect::<String>().chars().rev().collect::<String>()));
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+    match unsafe { WaitForSingleObject(child.as_raw_handle(), timeout_ms) } {
+        WAIT_OBJECT_0 => {
+            if child.wait().map_err(|e| format!("{stage}: {e}"))?.success() {
+                return Ok(());
             }
-            None if start.elapsed() > Duration::from_secs(600) => {
-                let _ = child.kill(); let _ = child.wait();
-                return Err(format!("{stage} timed out after ten minutes"));
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
+            let detail = fs::read_to_string(&error_path).unwrap_or_default();
+            Err(format!("{stage} failed: {}", detail.chars().rev().take(1500).collect::<String>().chars().rev().collect::<String>()))
         }
+        result => {
+            let error = if result == WAIT_TIMEOUT {
+                format!("{stage} timed out after {:?}", Duration::from_millis(timeout_ms.into()))
+            } else {
+                format!("{stage}: {}", std::io::Error::last_os_error())
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[test]
+    fn process_wait_reports_exit_and_timeout() {
+        let dir = std::env::temp_dir().join(format!("lumien-media-process-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shell = |command| {
+            let mut child = Command::new("cmd.exe");
+            child.args(["/d", "/c", command]).stdout(Stdio::null());
+            child
+        };
+        assert!(run(&mut shell("exit /b 0"), &dir, "test").is_ok());
+        let failed = run(&mut shell("echo media-error 1>&2 & exit /b 1"), &dir, "test").unwrap_err();
+        assert!(failed.contains("media-error"), "{failed}");
+        let mut waiting = Command::new("ping.exe");
+        waiting.args(["-n", "3", "127.0.0.1"]).stdout(Stdio::null());
+        let timeout = run_with_timeout(&mut waiting, &dir, "test", 10).unwrap_err();
+        assert!(timeout.contains("timed out"), "{timeout}");
+        fs::remove_file(dir.join("process-error.txt")).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 }
 
@@ -111,23 +151,25 @@ mod tests {
     }
 }
 
-pub fn read_prepared(path: &Path) -> Result<(&str, Vec<u8>), String> {
+pub fn open_prepared(path: &Path) -> Result<(&str, u32, fs::File), String> {
     let filename = path.file_name().and_then(|s| s.to_str()).ok_or("Invalid media filename")?;
-    if !filename.ends_with(".h264_2240x1080") || fs::metadata(path).map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
+    let data = fs::File::open(path).map_err(|e| e.to_string())?;
+    let metadata = data.metadata().map_err(|e| e.to_string())?;
+    if !filename.ends_with(".h264_2240x1080") || !metadata.is_file() || metadata.len() > 128 * 1024 * 1024 {
         return Err("Expected a prepared H.264 stream under 128 MB".into());
     }
-    let data = fs::read(path).map_err(|e| e.to_string())?;
-    if data.is_empty() { return Err("Empty video".into()); }
-    Ok((filename, data))
+    if metadata.len() == 0 { return Err("Empty video".into()); }
+    Ok((filename, metadata.len() as u32, data))
 }
 
 pub fn play_prepared(
     dev: &mut lumien_device::DisplaySession,
     filename: &str,
-    data: &[u8],
+    size: u32,
+    data: fs::File,
     clear_overlay: bool,
 ) -> Result<(), String> {
-    dev.transmit_file(filename, data, Duration::from_secs(10)).map_err(|e| format!("Video upload: {e:?}"))?;
+    dev.transmit_media(filename, size, data, Duration::from_secs(10)).map_err(|e| format!("Video upload: {e:?}"))?;
     let clear = clear_overlay.then(lumien_protocol::encode_clear_run_config_frame);
     for frame in clear.into_iter().chain([lumien_protocol::encode_work_config_frame(filename)]) {
         dev.write_frame(&frame, Duration::from_secs(5)).map_err(|e| format!("Playback write: {e:?}"))?;
@@ -141,8 +183,8 @@ pub fn play_prepared(
 /// Diagnostic CLI playback explicitly clears the overlay.
 #[allow(dead_code)] // This module is shared with the desktop app.
 pub fn play(path: &Path) -> Result<String, String> {
-    let (filename, data) = read_prepared(path)?;
+    let (filename, size, data) = open_prepared(path)?;
     let mut dev = lumien_device::DisplaySession::open_first().map_err(|e| format!("Open display: {e:?}"))?;
-    play_prepared(&mut dev, filename, &data, true)?;
+    play_prepared(&mut dev, filename, size, data, true)?;
     Ok(filename.into())
 }

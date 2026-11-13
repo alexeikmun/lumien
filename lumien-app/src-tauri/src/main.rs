@@ -1,5 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+macro_rules! log_usb {
+    ($level:expr, $message:expr $(,)?) => {
+        if cfg!(debug_assertions) {
+            crate::write_usb_debug($level, $message)
+        }
+    };
+}
+
 mod layout_files;
 mod cpu_temperature;
 mod monitor_power;
@@ -21,8 +29,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, LazyLock};
-use std::time::Duration;
-use tauri::Manager;
+use std::time::{Duration, Instant};
+use tauri::{Emitter, Manager};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
 use tauri::menu::{Menu, MenuItem};
 
@@ -63,7 +71,9 @@ extern "system" {
     fn GetSystemTimes(idle: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> i32;
     fn GlobalMemoryStatusEx(stat: *mut MEMORYSTATUSEX) -> i32;
     fn LoadLibraryA(name: *const u8) -> *mut c_void;
+    fn FreeLibrary(module: *mut c_void) -> i32;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     #[allow(dead_code)]
     fn GetLocalTime(lp_system_time: *mut SYSTEMTIME);
 }
@@ -75,7 +85,7 @@ fn hex_preview(data: &[u8]) -> String {
 
 #[inline]
 #[allow(unused_variables)]
-fn log_usb(level: &str, msg: &str) {
+fn write_usb_debug(_level: &str, _msg: &str) {
     // USB diagnostics go to the debug console.
     #[cfg(debug_assertions)]
     {
@@ -85,7 +95,7 @@ fn log_usb(level: &str, msg: &str) {
         let line = format!(
             "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}] [{:5}] {}\n",
             st.w_year, st.w_month, st.w_day, st.w_hour, st.w_minute, st.w_second, st.w_milliseconds,
-            level, msg
+            _level, _msg
         );
         print!("{}", line);
     }
@@ -107,11 +117,12 @@ struct GpuMonitor {
 unsafe impl Send for GpuMonitor {}
 unsafe impl Sync for GpuMonitor {}
 
-static GPU_MONITOR: Mutex<Option<GpuMonitor>> = Mutex::new(None);
+static GPU_MONITOR: Mutex<(Option<GpuMonitor>, Option<Instant>)> = Mutex::new((None, None));
 
-fn read_gpu_telemetry() -> (u32, u32) {
+fn read_gpu_telemetry(temperature: bool, load: bool) -> (u32, u32) {
     let mut lock = GPU_MONITOR.lock().unwrap();
-    if lock.is_none() {
+    if lock.0.is_none() && lock.1.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+        lock.1 = Some(Instant::now());
         unsafe {
             let lib = LoadLibraryA(b"nvml.dll\0".as_ptr());
             if !lib.is_null() {
@@ -128,26 +139,31 @@ fn read_gpu_telemetry() -> (u32, u32) {
                     if init() == 0 {
                         let mut dev: *mut c_void = std::ptr::null_mut();
                         if get_handle(0, &mut dev) == 0 && !dev.is_null() {
-                            *lock = Some(GpuMonitor {
+                            lock.0 = Some(GpuMonitor {
                                 _handle: lib,
                                 get_temp,
                                 get_util,
                                 dev,
                             });
+                        } else {
+                            let shutdown: Option<unsafe extern "system" fn() -> i32> =
+                                std::mem::transmute(GetProcAddress(lib, b"nvmlShutdown\0".as_ptr()));
+                            if let Some(shutdown) = shutdown { shutdown(); }
                         }
                     }
                 }
+                if lock.0.is_none() { FreeLibrary(lib); }
             }
         }
     }
 
-    if let Some(ref gpu) = *lock {
+    if let Some(ref gpu) = lock.0 {
         let mut temp = 0u32;
         let mut util = NvmlUtilization { gpu: 0, memory: 0 };
-        if let Some(f_temp) = gpu.get_temp {
+        if let Some(f_temp) = gpu.get_temp.filter(|_| temperature) {
             unsafe { f_temp(gpu.dev, 0, &mut temp); }
         }
-        if let Some(f_util) = gpu.get_util {
+        if let Some(f_util) = gpu.get_util.filter(|_| load) {
             unsafe { f_util(gpu.dev, &mut util); }
         }
         return (temp, util.gpu);
@@ -172,7 +188,14 @@ fn filetime_to_u64(ft: &FILETIME) -> u64 {
     ((ft.dw_high_date_time as u64) << 32) | (ft.dw_low_date_time as u64)
 }
 
-static LAST_CPU_TIMES: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
+struct CpuSample {
+    at: Instant,
+    idle: u64,
+    total: u64,
+    load: u32,
+}
+
+static LAST_CPU_TIMES: Mutex<Option<CpuSample>> = Mutex::new(None);
 static NETWORK: LazyLock<Mutex<NetworkSampler>> = LazyLock::new(|| Mutex::new(NetworkSampler::default()));
 
 fn read_network_rates() -> Option<NetworkRates> {
@@ -180,6 +203,13 @@ fn read_network_rates() -> Option<NetworkRates> {
 }
 
 fn read_cpu_load() -> u32 {
+    let mut last = LAST_CPU_TIMES.lock().unwrap();
+    let now = Instant::now();
+    if let Some(sample) = &*last {
+        if now.duration_since(sample.at) < Duration::from_millis(900) {
+            return sample.load;
+        }
+    }
     let mut idle = FILETIME { dw_low_date_time: 0, dw_high_date_time: 0 };
     let mut kernel = FILETIME { dw_low_date_time: 0, dw_high_date_time: 0 };
     let mut user = FILETIME { dw_low_date_time: 0, dw_high_date_time: 0 };
@@ -188,23 +218,15 @@ fn read_cpu_load() -> u32 {
         return 0;
     }
 
-    let i = filetime_to_u64(&idle);
-    let k = filetime_to_u64(&kernel);
-    let u = filetime_to_u64(&user);
-
-    let mut lock = LAST_CPU_TIMES.lock().unwrap();
-    if let Some((prev_i, prev_k, prev_u)) = *lock {
-        *lock = Some((i, k, u));
-        let d_idle = i.saturating_sub(prev_i);
-        let d_total = (k.saturating_sub(prev_k)) + (u.saturating_sub(prev_u));
-        if d_total > 0 && d_total >= d_idle {
-            let pct = ((d_total - d_idle) * 100) / d_total;
-            return pct as u32;
-        }
-    } else {
-        *lock = Some((i, k, u));
-    }
-    0
+    let idle = filetime_to_u64(&idle);
+    let total = filetime_to_u64(&kernel) + filetime_to_u64(&user);
+    let load = last.as_ref().map_or(0, |sample| {
+        let elapsed = total.saturating_sub(sample.total);
+        let busy = elapsed.saturating_sub(idle.saturating_sub(sample.idle));
+        (busy * 100).checked_div(elapsed).unwrap_or(0) as u32
+    });
+    *last = Some(CpuSample { at: now, idle, total, load });
+    load
 }
 
 #[derive(Clone)]
@@ -332,9 +354,11 @@ fn parse_hex_color(hex: &str) -> u32 {
     u32::from_str_radix(clean, 16).unwrap_or(0xFFFFFF)
 }
 
-fn blocks_usb(image: &str, pid: u32, own_pid: u32) -> bool {
+fn blocks_usb(image: &[u16], pid: u32, own_pid: u32) -> bool {
     pid != own_pid && ["KANALI.exe", "Screen.exe", "UDB.exe", "lumien-app.exe", "lumien-cli.exe"]
-        .iter().any(|name| image.eq_ignore_ascii_case(name))
+        .iter().any(|name| name.len() == image.len() && name.bytes().zip(image).all(|(a, &b)| {
+            u8::try_from(b).is_ok_and(|b| a.eq_ignore_ascii_case(&b))
+        }))
 }
 
 #[repr(C)]
@@ -375,8 +399,9 @@ fn ensure_usb_channel_available() -> Result<(), String> {
         }
         loop {
             let len = entry.image.iter().position(|c| *c == 0).unwrap_or(entry.image.len());
-            let image = String::from_utf16_lossy(&entry.image[..len]);
-            if blocks_usb(&image, entry.pid, std::process::id()) {
+            let image = &entry.image[..len];
+            if blocks_usb(image, entry.pid, std::process::id()) {
+                let image = String::from_utf16_lossy(image);
                 return Err(format!("Close {image} (PID {}) to avoid concurrent USB traffic", entry.pid));
             }
             if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
@@ -402,30 +427,86 @@ fn get_device_status() -> Result<String, String> {
     }
 }
 
-#[tauri::command]
-fn get_telemetry() -> Result<HashMap<String, Option<f64>>, String> {
-    let mut map = HashMap::new();
-    let cpu_load = read_cpu_load();
-    let ram_load = read_ram_load();
-    let (gpu_temp, gpu_load) = read_gpu_telemetry();
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Sensor {
+    CpuLoad,
+    CpuTemp,
+    Ram,
+    GpuLoad,
+    GpuTemp,
+    NetworkDownload,
+    NetworkUpload,
+}
 
-    map.insert("cpu_load".to_string(), Some(cpu_load as f64));
-    map.insert("cpu_temp".to_string(), cpu_temperature::read());
-    map.insert("ram".to_string(), Some(ram_load as f64));
-    map.insert("gpu_load".to_string(), Some(gpu_load as f64));
-    map.insert("gpu_temp".to_string(), Some(gpu_temp as f64));
-    let network = read_network_rates();
-    map.insert("network_download".into(), network.map(|r| r.download));
-    map.insert("network_upload".into(), network.map(|r| r.upload));
-    // Backward compatibility keys
-    map.insert("cpu".to_string(), Some(cpu_load as f64));
-    map.insert("gpu".to_string(), Some(gpu_load as f64));
-    Ok(map)
+impl Sensor {
+    fn for_binding(binding: &str) -> Self {
+        match binding {
+            "CPU temperature" => Self::CpuTemp,
+            "GPU load" => Self::GpuLoad,
+            "GPU temperature" => Self::GpuTemp,
+            "Memory usage" => Self::Ram,
+            "Network download" => Self::NetworkDownload,
+            "Network upload" => Self::NetworkUpload,
+            _ => Self::CpuLoad,
+        }
+    }
+}
+
+fn read_sensors(keys: &[Sensor]) -> HashMap<Sensor, Option<f64>> {
+    use Sensor::*;
+    let gpu_temp = keys.contains(&GpuTemp);
+    let gpu_load = keys.contains(&GpuLoad);
+    let gpu = (gpu_temp || gpu_load).then(|| read_gpu_telemetry(gpu_temp, gpu_load));
+    let network = (keys.contains(&NetworkDownload) || keys.contains(&NetworkUpload))
+        .then(read_network_rates).flatten();
+    let mut readings = HashMap::with_capacity(keys.len());
+    for &key in keys {
+        readings.entry(key).or_insert_with(|| match key {
+            CpuLoad => Some(read_cpu_load() as f64),
+            CpuTemp => cpu_temperature::read(),
+            Ram => Some(read_ram_load() as f64),
+            GpuTemp => gpu.map(|(temp, _)| temp as f64),
+            GpuLoad => gpu.map(|(_, load)| load as f64),
+            NetworkDownload => network.map(|r| r.download),
+            NetworkUpload => network.map(|r| r.upload),
+        });
+    }
+    readings
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Telemetry {
+    readings: HashMap<Sensor, Option<f64>>,
+    cpu_temp_status: Option<String>,
 }
 
 #[tauri::command]
-fn get_cpu_temperature_status() -> Option<String> {
-    cpu_temperature::status()
+fn get_telemetry(keys: Vec<Sensor>) -> Telemetry {
+    let readings = read_sensors(&keys);
+    let cpu_temp_status = keys.contains(&Sensor::CpuTemp).then(cpu_temperature::status).flatten();
+    Telemetry { readings, cpu_temp_status }
+}
+
+#[tauri::command]
+fn editor_active(window: tauri::WebviewWindow) -> bool {
+    let shown = window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
+    shown && monitor_power::state().on()
+}
+
+const EDITOR_ACTIVITY_CHANGED: &str = "editor-activity-changed";
+static EDITOR_SHOWN: AtomicBool = AtomicBool::new(false);
+
+fn editor_visibility_changed(app: &tauri::AppHandle, shown: bool) {
+    if EDITOR_SHOWN.swap(shown, Ordering::Relaxed) != shown {
+        let _ = app.emit(EDITOR_ACTIVITY_CHANGED, ());
+    }
+}
+
+#[tauri::command]
+fn warm_cpu_temperature() {
+    let _ = cpu_temperature::read();
 }
 
 fn pause_worker(worker: &mut Option<SyncWorker>) -> Result<(Option<DisplaySession>, Arc<Restore>), String> {
@@ -537,15 +618,15 @@ async fn play_youtube(app: tauri::AppHandle, url: String) -> Result<String, Stri
 }
 
 fn play_video_background(config: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
-    let (filename, data) = youtube::read_prepared(path)?;
-    change_background(config, filename, |dev| youtube::play_prepared(dev, filename, &data, false))?;
+    let (filename, size, data) = youtube::open_prepared(path)?;
+    change_background(config, filename, |dev| youtube::play_prepared(dev, filename, size, data, false))?;
     Ok(filename.into())
 }
 
 fn restore_video_background(config: &std::path::Path, dev: &mut DisplaySession, filename: &str) -> Result<(), String> {
     let path = video_gallery::resolve_filename(&config.join("youtube"), filename)?;
-    let (filename, data) = youtube::read_prepared(&path)?;
-    youtube::play_prepared(dev, filename, &data, false)
+    let (filename, size, data) = youtube::open_prepared(&path)?;
+    youtube::play_prepared(dev, filename, size, data, false)
 }
 
 fn change_background(
@@ -567,7 +648,7 @@ fn change_background(
         }
         activated = true;
         if let Err(e) = presets::save_active_preset(config, filename) {
-            log_usb("WARN", &format!("Could not remember active background: {e}"));
+            log_usb!("WARN", &format!("Could not remember active background: {e}"));
         }
         if !previous.frame.is_empty() {
             send_layout(&mut dev, &previous.frame).map_err(|error| {
@@ -590,18 +671,18 @@ fn activate_media(dev: &mut DisplaySession, file_name: &str) -> Result<(), Strin
     let frame = lumien_protocol::encode_work_config_frame(file_name);
     let t0 = std::time::Instant::now();
     dev.write_frame(&frame, Duration::from_millis(2000)).map_err(|e| {
-        log_usb("ERROR", &format!("Bulk OUT work_config frame failed: {:?}", e));
+        log_usb!("ERROR", &format!("Bulk OUT work_config frame failed: {:?}", e));
         format!("Write failed: {:?}", e)
     })?;
     let payload = dev.read_frame(Duration::from_millis(2000)).map_err(|e| {
-        log_usb("ERROR", &format!("Bulk IN WorkConfig ACK failed: {:?}", e));
+        log_usb!("ERROR", &format!("Bulk IN WorkConfig ACK failed: {:?}", e));
         format!("Read failed: {:?}", e)
     })?;
-    log_usb("READ", &format!("WorkConfig ACK ({} bytes) in {:?} | Hex: {}", payload.len(), t0.elapsed(),
+    log_usb!("READ", &format!("WorkConfig ACK ({} bytes) in {:?} | Hex: {}", payload.len(), t0.elapsed(),
         hex_preview(&payload[..std::cmp::min(16, payload.len())])));
     let ack = parse_response_frame(&lumien_protocol::encode_frame(&payload)).map_err(|e| format!("Invalid ACK: {:?}", e))?;
     if !ack.ok {
-        log_usb("WARN", "Device rejected work config command.");
+        log_usb!("WARN", "Device rejected work config command.");
         return Err("Device rejected work config command.".to_string());
     }
     Ok(())
@@ -609,7 +690,7 @@ fn activate_media(dev: &mut DisplaySession, file_name: &str) -> Result<(), Strin
 
 fn open_session(command: &str) -> Result<DisplaySession, String> {
     DisplaySession::open_first().map_err(|e| {
-        log_usb("ERROR", &format!("open_first failed during {command}: {:?}", e));
+        log_usb!("ERROR", &format!("open_first failed during {command}: {:?}", e));
         format!("Failed to open device: {:?}", e)
     })
 }
@@ -626,7 +707,7 @@ fn set_display_background(app: tauri::AppHandle, file_name: String) -> Result<St
         return Ok("Video playing as background.".into());
     }
     change_background(&config, &file_name, |dev| activate_media(dev, &file_name))?;
-    log_usb("INFO", "Background media switched successfully.");
+    log_usb!("INFO", "Background media switched successfully.");
     Ok(format!("Background set to {}", file_name))
 }
 
@@ -635,14 +716,14 @@ fn set_solid_color_background(app: tauri::AppHandle, color: String) -> Result<St
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     let (file_name, data) = presets::get_or_create_solid_color_video(&config_dir, &color)?;
 
-    log_usb("INFO", &format!("Executing set_solid_color_background: {} ({} bytes)", file_name, data.len()));
+    log_usb!("INFO", &format!("Executing set_solid_color_background: {} ({} bytes)", file_name, data.len()));
 
     change_background(&config_dir, &file_name, |dev| {
         dev.transmit_file(&file_name, &data, Duration::from_millis(2000))
             .map_err(|e| format!("Transmit solid background failed: {e:?}"))?;
         activate_media(dev, &file_name)
     })?;
-    log_usb("INFO", &format!("Solid color background ({}) activated successfully.", color));
+    log_usb!("INFO", &format!("Solid color background ({}) activated successfully.", color));
     Ok(format!("Solid background ({}) activated on display.", color))
 }
 
@@ -762,10 +843,10 @@ fn apply_scene(app: tauri::AppHandle, scene_json: String) -> Result<String, Stri
         }
     }
 
-    log_usb("INFO", &format!("Encoding scene '{}' ({} widgets)...", scene.name, scene.widgets.len()));
+    log_usb!("INFO", &format!("Encoding scene '{}' ({} widgets)...", scene.name, scene.widgets.len()));
     let frame = encode_run_config_frame(&groups)
         .map_err(|e| {
-            log_usb("ERROR", &format!("Geometry/Encoding error: {:?}", e));
+            log_usb!("ERROR", &format!("Geometry/Encoding error: {:?}", e));
             format!("Geometry/Encoding error: {:?}", e)
         })?;
 
@@ -782,7 +863,7 @@ fn apply_scene(app: tauri::AppHandle, scene_json: String) -> Result<String, Stri
             return Err(e);
         }
         Err(Transfer::Failed(e)) => {
-            log_usb("WARN", &format!("Display not ready ({e}); layout queued for automatic apply."));
+            log_usb!("WARN", &format!("Display not ready ({e}); layout queued for automatic apply."));
             dev = None;
             "Display is not responding yet. Lumien will apply this layout automatically as soon as it is ready.".to_string()
         }
@@ -804,19 +885,19 @@ fn send_layout(dev: &mut Option<DisplaySession>, frame: &[u8]) -> Result<(), Tra
 fn send_run_config(dev: &mut DisplaySession, frame: &[u8]) -> Result<(), Transfer> {
     let t0 = std::time::Instant::now();
     dev.write_frame(frame, Duration::from_millis(2000)).map_err(|e| {
-        log_usb("ERROR", &format!("Bulk OUT RunConfig failed: {:?}", e));
+        log_usb!("ERROR", &format!("Bulk OUT RunConfig failed: {:?}", e));
         Transfer::Failed(format!("Write failed: {:?}", e))
     })?;
     let payload = dev.read_frame(Duration::from_millis(2000)).map_err(|e| {
-        log_usb("ERROR", &format!("Bulk IN RunConfig ACK failed: {:?}", e));
+        log_usb!("ERROR", &format!("Bulk IN RunConfig ACK failed: {:?}", e));
         Transfer::Failed(format!("Read failed: {:?}", e))
     })?;
-    log_usb("READ", &format!("RunConfig ({} bytes) ACK ({} bytes) in {:?} | Hex: {}", frame.len(), payload.len(), t0.elapsed(),
+    log_usb!("READ", &format!("RunConfig ({} bytes) ACK ({} bytes) in {:?} | Hex: {}", frame.len(), payload.len(), t0.elapsed(),
         hex_preview(&payload[..std::cmp::min(16, payload.len())])));
     let ack = parse_response_frame(&lumien_protocol::encode_frame(&payload))
         .map_err(|e| Transfer::Failed(format!("Invalid response frame: {:?}", e)))?;
     if !ack.ok {
-        log_usb("WARN", "Device rejected layout frame.");
+        log_usb!("WARN", "Device rejected layout frame.");
         return Err(Transfer::Rejected("Device rejected layout frame.".to_string()));
     }
     Ok(())
@@ -843,7 +924,7 @@ fn restore_display(dev: &mut DisplaySession, restore: &Restore) -> Result<(), St
                 activate_media(dev, &media)
             };
             if let Err(e) = background {
-                log_usb("WARN", &format!("Restore: background {media} not re-activated: {e}"));
+                log_usb!("WARN", &format!("Restore: background {media} not re-activated: {e}"));
             }
         }
     }
@@ -859,13 +940,14 @@ fn restore_display(dev: &mut DisplaySession, restore: &Restore) -> Result<(), St
 /// answering or the PC resumes from sleep, reconnects and restores background + layout with backoff.
 fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: &Restore) -> Option<DisplaySession> {
     const MAX_BACKOFF: Duration = Duration::from_secs(10);
-    log_usb("INFO", "Layout worker started (1 Hz telemetry, automatic display recovery).");
+    log_usb!("INFO", "Layout worker started (1 Hz telemetry, automatic display recovery).");
     let mut seen_resumes = monitor_power::state().resumes;
     let mut synced = None;
     let mut restore_on_wake = dev.is_none() && restore.recover_content;
     let mut attempted_off = None;
     let mut backoff = Duration::from_secs(1);
     let mut failures = 0u32;
+    let keys: Vec<_> = restore.bindings.iter().map(|b| Sensor::for_binding(&b.sensor)).collect();
     while !stop.load(Ordering::SeqCst) {
         let state = monitor_power::state();
         if state.resumes != seen_resumes {
@@ -886,13 +968,13 @@ fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: 
             if !on { attempted_off = Some(state.transitions); }
             match ensure_usb_channel_available().and_then(|_| open_session("monitor power")) {
                 Ok(d) => {
-                    log_usb("INFO", &format!("Display connection opened after {failures} failed attempt(s)."));
+                    log_usb!("INFO", &format!("Display connection opened after {failures} failed attempt(s)."));
                     dev = Some(d);
                     synced = None;
                 }
                 Err(e) => {
                     failures += 1;
-                    if failures == 1 || failures % 30 == 0 { log_usb("WARN", &format!("Display restore attempt {failures} failed: {e}")); }
+                    if failures == 1 || failures % 30 == 0 { log_usb!("WARN", &format!("Display restore attempt {failures} failed: {e}")); }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
@@ -913,7 +995,7 @@ fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: 
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
-                    log_usb("WARN", &format!("Monitor power sync failed: {e}"));
+                    log_usb!("WARN", &format!("Monitor power sync failed: {e}"));
                     dev = None;
                     if !on { attempted_off = Some(state.transitions); }
                     restore_on_wake = restore.recover_content;
@@ -934,27 +1016,14 @@ fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: 
         let telemetry = on && !restore.bindings.is_empty();
         if !monitor_power::wait(state, telemetry.then_some(Duration::from_secs(1)), stop) { continue; }
 
-        let cpu = read_cpu_load();
-        let ram = read_ram_load();
-        let (gpu_temp, gpu_load) = read_gpu_telemetry();
-        let network = read_network_rates();
-        let updates: Vec<_> = restore.bindings.iter().map(|b| {
-            let value = match b.sensor.as_str() {
-                "CPU load" => Some(cpu as f64),
-                "CPU temperature" => cpu_temperature::read(),
-                "GPU load" => Some(gpu_load as f64),
-                "GPU temperature" => Some(gpu_temp as f64),
-                "Memory usage" => Some(ram as f64),
-                "Network download" => network.map(|r| r.download),
-                "Network upload" => network.map(|r| r.upload),
-                _ => Some(cpu as f64),
-            };
-            binding_update(b, value)
-        }).collect();
+        let readings = read_sensors(&keys);
+        let updates: Vec<_> = restore.bindings.iter().zip(&keys)
+            .map(|(binding, key)| binding_update(binding, readings[key]))
+            .collect();
         let Ok(update_frame) = encode_batch_label_update_frame(&updates) else { continue };
 
         if let Err(e) = ensure_usb_channel_available() {
-            log_usb("WARN", &format!("Telemetry paused: {e}"));
+            log_usb!("WARN", &format!("Telemetry paused: {e}"));
             dev = None;
             restore_on_wake = restore.recover_content;
             continue;
@@ -969,17 +1038,17 @@ fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: 
                 other => Err(format!("ACK rejected/invalid: {:?}", other)),
             });
         match result {
-            Ok(n) => log_usb("SYNC", &format!("Tick OK: Out {}B, In {}B [CPU: {}%, GPU: {}°C/{}%, RAM: {}%]", update_frame.len(), n, cpu, gpu_temp, gpu_load, ram)),
+            Ok(n) => log_usb!("SYNC", &format!("Tick OK: Out {}B, In {}B {readings:?}", update_frame.len(), n)),
             Err(e) => {
                 // A rejected update usually means the display lost the layout (reset); restore it.
-                log_usb("WARN", &format!("Telemetry tick failed ({e}); reconnecting and restoring the display."));
+                log_usb!("WARN", &format!("Telemetry tick failed ({e}); reconnecting and restoring the display."));
                 dev = None;
                 restore_on_wake = true;
                 backoff = Duration::from_secs(1);
             }
         }
     }
-    log_usb("INFO", "Layout worker stopped.");
+    log_usb!("INFO", "Layout worker stopped.");
     dev
 }
 
@@ -988,6 +1057,7 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        editor_visibility_changed(app, window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false));
     }
 }
 
@@ -1072,7 +1142,7 @@ fn ensure_autostart_registered() {
                     let _ = hidden("reg").args(["delete", RUN_KEY, "/v", "Lumien", "/f"]).status();
                     return;
                 }
-                Err(e) => log_usb("WARN", &format!("Elevated autostart task not registered: {e}")),
+                Err(e) => log_usb!("WARN", &format!("Elevated autostart task not registered: {e}")),
             }
         }
         // Not elevated: keep an existing elevated task; otherwise fall back to the (unelevated) Run entry.
@@ -1163,6 +1233,19 @@ fn main() {
             setup_tray(app)?;
             ensure_autostart_registered();
             monitor_power::watch();
+            let app_handle = app.handle().clone();
+            let mut previous = monitor_power::state();
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                loop {
+                    monitor_power::wait(previous, None, &stop);
+                    let current = monitor_power::state();
+                    if current.on() != previous.on() {
+                        let _ = app_handle.emit(EDITOR_ACTIVITY_CHANGED, ());
+                    }
+                    previous = current;
+                }
+            });
             if let Ok(mut worker) = SYNC_WORKER.lock() {
                 let restore = Restore {
                     frame: Vec::new(), config_dir: app.path().app_config_dir().ok(),
@@ -1170,9 +1253,6 @@ fn main() {
                 };
                 *worker = Some(SyncWorker::start(None, Arc::new(restore)));
             }
-            // Start the CPU temperature helper now: LibreHardwareMonitor takes seconds to open its sensors,
-            // so the startup layout apply would otherwise always begin with an empty reading.
-            let _ = cpu_temperature::read();
             if !is_autostart_launch(std::env::args()) {
                 show_main_window(&app.handle());
             }
@@ -1182,6 +1262,10 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                editor_visibility_changed(window.app_handle(), window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false));
+            }
+            if matches!(event, tauri::WindowEvent::Focused(_) | tauri::WindowEvent::Resized(_)) {
+                editor_visibility_changed(window.app_handle(), window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false));
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1192,7 +1276,8 @@ fn main() {
             layout_files::remember_layout,
             get_device_status,
             get_telemetry,
-            get_cpu_temperature_status,
+            editor_active,
+            warm_cpu_temperature,
             apply_scene,
             clear_display,
             list_presets,
@@ -1221,11 +1306,13 @@ mod sync_tests {
     }
     #[test]
     fn preflight_blocks_competing_writers_but_allows_current_process() {
-        assert!(blocks_usb("udb.exe", 12, 42));
-        assert!(blocks_usb("Screen.exe", 12, 42));
-        assert!(blocks_usb("lumien-app.exe", 12, 42));
-        assert!(!blocks_usb("lumien-app.exe", 42, 42));
-        assert!(!blocks_usb("explorer.exe", 12, 42));
+        let blocks = |name: &str, pid| blocks_usb(&name.encode_utf16().collect::<Vec<_>>(), pid, 42);
+        assert!(blocks("udb.exe", 12));
+        assert!(blocks("Screen.exe", 12));
+        assert!(blocks("lumien-app.exe", 12));
+        assert!(!blocks("lumien-app.exe", 42));
+        assert!(!blocks("explorer.exe", 12));
+        assert!(!blocks("ＵDB.exe", 12));
     }
     #[test]
     fn stopping_worker_waits_for_handle_owner_to_exit() {
@@ -1315,7 +1402,7 @@ mod sync_tests {
 
     #[test]
     fn log_usb_no_op_callable_safely() {
-        log_usb("TEST", "verifying call safety");
+        log_usb!("TEST", "verifying call safety");
     }
 
     #[test]

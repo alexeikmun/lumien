@@ -4,6 +4,7 @@
 
 use lumien_protocol::{decode_frame, DeviceResponse, ProtocolError, FRAME_HEADER_LEN};
 use std::ffi::c_void;
+use std::io::Read;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, mpsc};
@@ -151,6 +152,7 @@ pub enum DeviceError {
     Timeout,
     IncompleteWrite { expected: usize, actual: usize },
     BufferOverflow,
+    MediaRead(std::io::ErrorKind),
     Protocol(ProtocolError),
     /// Device answered with a non-OK status for the named transaction stage.
     Rejected(String),
@@ -459,7 +461,8 @@ impl PanoramaDevice {
 
     /// Transmits a media file to device eMMC via FileTransmitBegin (400) -> FileTransmitData (401) -> FileTransmitEnd (402).
     pub fn transmit_file(&mut self, file_name: &str, data: &[u8], timeout: Duration) -> Result<(), DeviceError> {
-        transmit_file_with(file_name, data, |frame| {
+        let size = u32::try_from(data.len()).map_err(|_| DeviceError::BufferOverflow)?;
+        transmit_file_with(file_name, size, data, |frame| {
             self.write_frame(frame, timeout)?;
             self.read_frame(timeout)
         })
@@ -576,7 +579,13 @@ impl DisplaySession {
 
     /// Transmits a media file to device eMMC via FileTransmitBegin (400) -> FileTransmitData (401) -> FileTransmitEnd (402).
     pub fn transmit_file(&mut self, file_name: &str, data: &[u8], timeout: Duration) -> Result<(), DeviceError> {
-        transmit_file_with(file_name, data, |frame| {
+        let size = u32::try_from(data.len()).map_err(|_| DeviceError::BufferOverflow)?;
+        self.transmit_media(file_name, size, data, timeout)
+    }
+
+    /// Upload exactly `size` bytes without loading the whole media file into memory.
+    pub fn transmit_media(&mut self, file_name: &str, size: u32, data: impl Read, timeout: Duration) -> Result<(), DeviceError> {
+        transmit_file_with(file_name, size, data, |frame| {
             self.write_frame(frame, timeout)?;
             self.read_frame(timeout)
         })
@@ -593,7 +602,8 @@ impl Drop for DisplaySession {
 /// Shared FileTransmit transaction; device status codes (e.g. SpaceNotEnough, CRCFail) are kept in the error.
 fn transmit_file_with(
     file_name: &str,
-    data: &[u8],
+    size: u32,
+    mut data: impl Read,
     mut transact: impl FnMut(&[u8]) -> Result<Vec<u8>, DeviceError>,
 ) -> Result<(), DeviceError> {
     let mut exchange = |frame: Vec<u8>, stage: &str| -> Result<(), DeviceError> {
@@ -603,12 +613,20 @@ fn transmit_file_with(
             _ => Err(DeviceError::Rejected(format!("{stage}: not acknowledged"))),
         }
     };
-    exchange(lumien_protocol::encode_file_transmit_begin_frame(file_name, data.len() as u32), "begin")?;
     const CHUNK_SIZE: usize = 65536;
-    for chunk in data.chunks(CHUNK_SIZE) {
+    let mut buffer = vec![0; CHUNK_SIZE.min(size as usize)];
+    let mut remaining = size as usize;
+    let mut crc = 0;
+    exchange(lumien_protocol::encode_file_transmit_begin_frame(file_name, size), "begin")?;
+    while remaining != 0 {
+        let len = remaining.min(buffer.len());
+        let chunk = &mut buffer[..len];
+        data.read_exact(chunk).map_err(|e| DeviceError::MediaRead(e.kind()))?;
+        crc = lumien_protocol::extend_crc32c(crc, chunk);
         exchange(lumien_protocol::encode_file_transmit_data_frame(chunk), "data")?;
+        remaining -= len;
     }
-    exchange(lumien_protocol::encode_file_transmit_end_frame("media", lumien_protocol::crc32c(data)), "end")
+    exchange(lumien_protocol::encode_file_transmit_end_frame("media", crc), "end")
 }
 
 fn take_session_frame(buffered: &mut Vec<u8>) -> Result<Option<Vec<u8>>, DeviceError> {
@@ -627,6 +645,33 @@ fn take_session_frame(buffered: &mut Vec<u8>) -> Result<Option<Vec<u8>>, DeviceE
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    #[test]
+    fn streamed_upload_preserves_frames_and_checksum() {
+        use lumien_protocol::*;
+        let data = vec![0x42; 65539];
+        let expected = [
+            encode_file_transmit_begin_frame("test", data.len() as u32),
+            encode_file_transmit_data_frame(&data[..65536]),
+            encode_file_transmit_data_frame(&data[65536..]),
+            encode_file_transmit_end_frame("media", crc32c(&data)),
+        ];
+        let mut frames = Vec::new();
+        let ack = [0x0a, 0x02, 0x08, 0x01, 0x12, 0x00, 0xc2, 0x25, 0x04, 0x0a, 0x02, b'o', b'k'];
+        let result = transmit_file_with("test", data.len() as u32, data.as_slice(), |frame| {
+            frames.push(frame.to_vec());
+            Ok(ack.to_vec())
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(frames, expected);
+
+        let mut frames = Vec::new();
+        let result = transmit_file_with("test", 65539, &data[..65536], |frame| {
+            frames.push(frame.to_vec());
+            Ok(ack.to_vec())
+        });
+        assert!(matches!(result, Err(DeviceError::MediaRead(std::io::ErrorKind::UnexpectedEof))));
+        assert_eq!(frames, expected[..2]);
+    }
     #[test]
     fn session_preserves_partial_and_coalesced_frames() {
         let first = lumien_protocol::encode_frame(b"one");

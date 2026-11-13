@@ -2,11 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const BUILTIN_1_PNG: &[u8] = include_bytes!("../../src/assets/presets/default_01.png");
-const BUILTIN_2_PNG: &[u8] = include_bytes!("../../src/assets/presets/default_02.png");
-const BUILTIN_3_PNG: &[u8] = include_bytes!("../../src/assets/presets/default_03.png");
-const BUILTIN_4_PNG: &[u8] = include_bytes!("../../src/assets/presets/default_04.png");
-
 const SOLID_000000_H264: &[u8] = include_bytes!("../assets/swatches/solid_000000.h264_2240x1080");
 const SOLID_0C151D_H264: &[u8] = include_bytes!("../assets/swatches/solid_0c151d.h264_2240x1080");
 const SOLID_18262E_H264: &[u8] = include_bytes!("../assets/swatches/solid_18262e.h264_2240x1080");
@@ -85,7 +80,7 @@ pub fn get_builtin_presets() -> Vec<PresetItem> {
             id: "builtin_01".into(),
             name: "Cooling delivery".into(),
             file_name: "default_01.mp4.h264_2240x1080".into(),
-            thumbnail: make_data_url(BUILTIN_1_PNG, "png"),
+            thumbnail: String::new(),
             is_builtin: true,
             is_active: false,
         },
@@ -93,7 +88,7 @@ pub fn get_builtin_presets() -> Vec<PresetItem> {
             id: "builtin_02".into(),
             name: "Migration".into(),
             file_name: "default_02.mp4.h264_2240x1080".into(),
-            thumbnail: make_data_url(BUILTIN_2_PNG, "png"),
+            thumbnail: String::new(),
             is_builtin: true,
             is_active: false,
         },
@@ -101,7 +96,7 @@ pub fn get_builtin_presets() -> Vec<PresetItem> {
             id: "builtin_03".into(),
             name: "Quantum time capsule".into(),
             file_name: "default_03.mp4.h264_2240x1080".into(),
-            thumbnail: make_data_url(BUILTIN_3_PNG, "png"),
+            thumbnail: String::new(),
             is_builtin: true,
             is_active: false,
         },
@@ -109,7 +104,7 @@ pub fn get_builtin_presets() -> Vec<PresetItem> {
             id: "builtin_04".into(),
             name: "Exo-Ecologies".into(),
             file_name: "default_04.mp4.h264_2240x1080".into(),
-            thumbnail: make_data_url(BUILTIN_4_PNG, "png"),
+            thumbnail: String::new(),
             is_builtin: true,
             is_active: false,
         },
@@ -249,12 +244,12 @@ pub fn get_all_presets(app_config_dir: &Path) -> Vec<PresetItem> {
             presets = get_builtin_presets();
         }
     } else {
-        // Always refresh built-in preset thumbnails so compiled-in assets are authoritative
+        // Old catalogs may contain copies of the thumbnails now bundled with the editor.
         let builtins = get_builtin_presets();
         for p in &mut presets {
             if p.is_builtin {
-                if let Some(b) = builtins.iter().find(|bi| bi.id == p.id || bi.file_name == p.file_name) {
-                    p.thumbnail = b.thumbnail.clone();
+                if builtins.iter().any(|bi| bi.file_name == p.file_name) {
+                    p.thumbnail.clear();
                 }
             }
         }
@@ -366,7 +361,7 @@ mod tests {
         assert_eq!(presets.len(), 4);
         assert_eq!(presets[0].name, "Cooling delivery");
         assert_eq!(presets[0].file_name, "default_01.mp4.h264_2240x1080");
-        assert!(presets[0].thumbnail.starts_with("data:image/png;base64,"));
+        assert!(presets.iter().all(|preset| preset.thumbnail.is_empty()));
         assert!(presets[0].is_builtin);
     }
 

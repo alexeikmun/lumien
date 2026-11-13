@@ -103,7 +103,7 @@ pub fn sync(dev: &mut DisplaySession, config: &Path, on: bool) -> Result<bool, S
 
 fn log_change(target: DisplayPower) {
     let state = if target.enabled { "on" } else { "off" };
-    crate::log_usb(
+    log_usb!(
         "INFO",
         &format!(
             "Monitor power sync: TRYX display {state} (brightness {})",
@@ -248,12 +248,12 @@ pub fn watch() {
         PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, sleep_params, &mut handle)
     };
     if display != 0 || resume != 0 {
-        crate::log_usb(
+        log_usb!(
             "WARN",
             &format!("Windows power notification registration: display={display}, sleep={resume}"),
         );
     } else {
-        crate::log_usb(
+        log_usb!(
             "INFO",
             "Windows monitor and sleep power notifications registered.",
         );

@@ -1,5 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Scene } from './scene';
+import type { sensors } from './metrics';
+
+export type SensorKey = typeof sensors[number]['key'];
+interface Telemetry {
+  readings: Record<string, number | null>;
+  cpuTempStatus: string | null;
+}
 
 export interface DeviceStatus {
   connected: boolean;
@@ -10,8 +17,7 @@ export interface DeviceAdapter {
   getStatus(): Promise<DeviceStatus>;
   applyScene(scene: Scene): Promise<string>;
   clearDisplay(): Promise<string>;
-  getTelemetry(): Promise<Record<string, number | null>>;
-  getCpuTemperatureStatus(): Promise<string | null>;
+  getTelemetry(keys: SensorKey[]): Promise<Telemetry>;
 }
 
 export class RealDeviceAdapter implements DeviceAdapter {
@@ -45,18 +51,11 @@ export class RealDeviceAdapter implements DeviceAdapter {
     return await invoke<string>('clear_display');
   }
 
-  async getTelemetry(): Promise<Record<string, number | null>> {
+  async getTelemetry(keys: SensorKey[]): Promise<Telemetry> {
     if (!this.isTauri()) {
-      return {};
+      return { readings: {}, cpuTempStatus: null };
     }
-    return await invoke<Record<string, number | null>>('get_telemetry');
-  }
-
-  async getCpuTemperatureStatus(): Promise<string | null> {
-    if (!this.isTauri()) {
-      return null;
-    }
-    return await invoke<string | null>('get_cpu_temperature_status');
+    return await invoke<Telemetry>('get_telemetry', { keys });
   }
 }
 

@@ -423,11 +423,16 @@ const CRC32C_TABLE: [u32; 256] = {
 ///
 /// Verified identical to TRYX UDB.exe native implementation at address 0x4d970.
 pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFFFFFFu32;
+    extend_crc32c(0, data)
+}
+
+/// Extend a finalized CRC32C with another chunk. Use zero for the first chunk.
+pub fn extend_crc32c(previous: u32, data: &[u8]) -> u32 {
+    let mut crc = !previous;
     for &b in data {
         crc = CRC32C_TABLE[((crc ^ (b as u32)) & 0xFF) as usize] ^ (crc >> 8);
     }
-    crc ^ 0xFFFFFFFF
+    !crc
 }
 
 /// Encodes a complete FileTransmitBeginPb frame (ReqPackagePb tag 400).
@@ -989,6 +994,7 @@ mod tests {
     fn test_crc32c_standard_vectors() {
         assert_eq!(crc32c(b"123456789"), 0xe3069283);
         assert_eq!(crc32c(b""), 0x00000000);
+        assert_eq!(extend_crc32c(crc32c(b"1234"), b"56789"), 0xe3069283);
     }
 
     #[test]
