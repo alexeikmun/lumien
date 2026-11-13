@@ -357,10 +357,8 @@ fn visit_fields(mut bytes: &[u8], mut field: impl FnMut(u64, u64, Option<&[u8]>)
                 bytes = &bytes[end..];
             }
             2 => {
-                let (len, start) = decode_varint(bytes, 0)?;
-                let end = start.checked_add(usize::try_from(len).map_err(|_| ProtocolError::InvalidResponse)?)
-                    .filter(|end| *end <= bytes.len()).ok_or(ProtocolError::InvalidResponse)?;
-                field(tag >> 3, 0, Some(&bytes[start..end]))?;
+                let (body, end) = response_body(bytes, 0)?;
+                field(tag >> 3, 0, Some(body))?;
                 bytes = &bytes[end..];
             }
             wire @ (1 | 5) => {
@@ -372,31 +370,32 @@ fn visit_fields(mut bytes: &[u8], mut field: impl FnMut(u64, u64, Option<&[u8]>)
     Ok(())
 }
 
-pub fn parse_display_power_response(payload: &[u8]) -> Result<DisplayPower, ProtocolError> {
+fn response_body(bytes: &[u8], offset: usize) -> Result<(&[u8], usize), ProtocolError> {
+    let (len, start) = decode_varint(bytes, offset)?;
+    let end = start.checked_add(usize::try_from(len).map_err(|_| ProtocolError::InvalidResponse)?)
+        .filter(|end| *end <= bytes.len()).ok_or(ProtocolError::InvalidResponse)?;
+    Ok((&bytes[start..end], end))
+}
+
+fn parse_display_power_config(config: &[u8]) -> Result<Option<DisplayPower>, ProtocolError> {
     let mut display = None;
-    visit_fields(payload, |tag, _, body| {
-        if tag == 2 && body != Some(&[]) { return Err(ProtocolError::InvalidResponse); }
-        if let (504, Some(config)) = (tag, body) {
-            visit_fields(config, |tag, _, body| {
-                if let (5, Some(body)) = (tag, body) {
-                    let mut power = DisplayPower { enabled: false, brightness: 0 };
-                    visit_fields(body, |tag, value, bytes| {
-                        match (tag, bytes) {
-                            (1, None) if value <= 1 => power.enabled = value == 1,
-                            (2, None) if value <= 100 => power.brightness = value as u8,
-                            (1 | 2, _) => return Err(ProtocolError::InvalidResponse),
-                            _ => {}
-                        }
-                        Ok(())
-                    })?;
-                    display = Some(power);
+    visit_fields(config, |tag, _, body| {
+        if let (5, Some(body)) = (tag, body) {
+            let mut power = DisplayPower { enabled: false, brightness: 0 };
+            visit_fields(body, |tag, value, bytes| {
+                match (tag, bytes) {
+                    (1, None) if value <= 1 => power.enabled = value == 1,
+                    (2, None) if value <= 100 => power.brightness = value as u8,
+                    (1 | 2, _) => return Err(ProtocolError::InvalidResponse),
+                    _ => {}
                 }
                 Ok(())
             })?;
+            display = Some(power);
         }
         Ok(())
     })?;
-    display.ok_or(ProtocolError::InvalidResponse)
+    Ok(display)
 }
 
 /// Precomputed 256-entry table for Castagnoli CRC32C (polynomial 0x82F63B78).
@@ -534,6 +533,7 @@ pub struct DeviceInfo {
 pub enum DeviceResponse {
     Ack(DeviceAck),
     Info(DeviceInfo),
+    DisplayPower(DisplayPower),
     Error { code: String, why: String },
 }
 
@@ -544,6 +544,7 @@ pub fn parse_device_response(frame_bytes: &[u8]) -> Result<DeviceResponse, Proto
     let mut version = 0;
     let mut ok = false;
     let mut device_info = None;
+    let mut display_power = None;
     let mut err_code = String::new();
     let mut err_why = String::new();
 
@@ -575,28 +576,16 @@ pub fn parse_device_response(frame_bytes: &[u8]) -> Result<DeviceResponse, Proto
                 offset = end;
             }
             (2, 2) => {
-                // ErrorPb length-delimited
-                let (len, new_offset) = decode_varint(payload, offset)?;
-                offset = new_offset;
-                let end = offset + len as usize;
-                if end > payload.len() {
-                    return Err(ProtocolError::BufferTooShort { expected: end, actual: payload.len() });
-                }
-                let mut e_off = offset;
-                while e_off < end {
-                    let (e_tag, next_e) = decode_varint(payload, e_off)?;
-                    e_off = next_e;
-                    let f = (e_tag >> 3) as u32;
-                    let w = (e_tag & 7) as u8;
-                    if w == 2 {
-                        let (s_len, next_s) = decode_varint(payload, e_off)?;
-                        e_off = next_s;
-                        let s_end = e_off + s_len as usize;
-                        let s = String::from_utf8_lossy(&payload[e_off..s_end]).to_string();
-                        if f == 1 { err_code = s; } else if f == 2 { err_why = s; }
-                        e_off = s_end;
+                let (body, end) = response_body(payload, offset)?;
+                visit_fields(body, |tag, value, bytes| {
+                    match (tag, bytes) {
+                        (1, Some(code)) => err_code = String::from_utf8_lossy(code).into_owned(),
+                        (1, None) if value != 0 => err_code = (value as i32).to_string(),
+                        (2, Some(why)) => err_why = String::from_utf8_lossy(why).into_owned(),
+                        _ => {}
                     }
-                }
+                    Ok(())
+                })?;
                 offset = end;
             }
             (500, 2) => {
@@ -638,22 +627,23 @@ pub fn parse_device_response(frame_bytes: &[u8]) -> Result<DeviceResponse, Proto
                 device_info = Some(info);
                 offset = end;
             }
+            (504, 2) => {
+                let (body, end) = response_body(payload, offset)?;
+                display_power = parse_display_power_config(body)?;
+                offset = end;
+            }
             (501, 2) => {
                 // DeviceAuthPb length-delimited: field 1 = string "ok"
-                let (len, new_offset) = decode_varint(payload, offset)?;
-                offset = new_offset;
-                let end = offset + len as usize;
-                if payload[offset..end] == [0x0a, 0x02, b'o', b'k'] {
+                let (body, end) = response_body(payload, offset)?;
+                if body == [0x0a, 0x02, b'o', b'k'] {
                     ok = true;
                 }
                 offset = end;
             }
             (600, 2) => {
                 // DummyMsgPb length-delimited: field 1 = string "ok"
-                let (len, new_offset) = decode_varint(payload, offset)?;
-                offset = new_offset;
-                let end = offset + len as usize;
-                if payload[offset..end] == [0x0a, 0x02, b'o', b'k'] {
+                let (body, end) = response_body(payload, offset)?;
+                if body == [0x0a, 0x02, b'o', b'k'] {
                     ok = true;
                 }
                 offset = end;
@@ -719,6 +709,9 @@ pub fn parse_device_response(frame_bytes: &[u8]) -> Result<DeviceResponse, Proto
 
     if let Some(info) = device_info {
         return Ok(DeviceResponse::Info(info));
+    }
+    if let Some(power) = display_power {
+        return Ok(DeviceResponse::DisplayPower(power));
     }
 
     Ok(DeviceResponse::Ack(DeviceAck { version, ok }))
@@ -805,8 +798,12 @@ mod tests {
         assert_eq!(encode_display_power_frame(false, 25),
             b"TRYX\x0d\x00\x00\x00\x0a\x02\x08\x01\xc2\x0c\x06\x2a\x04\x08\x00\x10\x19");
         let off = b"\x0a\x02\x08\x01\x12\x00\xc2\x1f\x04\x2a\x02\x10\x19";
-        assert_eq!(parse_display_power_response(off), Ok(DisplayPower { enabled: false, brightness: 25 }));
-        assert!(parse_display_power_response(&off[..off.len() - 1]).is_err());
+        assert_eq!(parse_device_response(&encode_frame(off)), Ok(DeviceResponse::DisplayPower(DisplayPower { enabled: false, brightness: 25 })));
+        assert!(parse_device_response(&encode_frame(&off[..off.len() - 1])).is_err());
+        let mut rejected = off.to_vec();
+        encode_length_delimited(2, b"\x08\x05\x12\x04busy", &mut rejected);
+        assert_eq!(parse_device_response(&encode_frame(&rejected)),
+            Ok(DeviceResponse::Error { code: "5".into(), why: "busy".into() }));
     }
 
     #[test]

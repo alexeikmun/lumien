@@ -2,11 +2,11 @@
 //!
 //! Uses Microsoft in-box usbprint / USB device interface via Win32 asynchronous I/O.
 
-use lumien_protocol::{decode_frame, ProtocolError, FRAME_HEADER_LEN};
+use lumien_protocol::{decode_frame, DeviceResponse, ProtocolError, FRAME_HEADER_LEN};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+use std::sync::{Arc, mpsc};
 
 pub type Handle = *mut c_void;
 pub const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
@@ -22,6 +22,7 @@ const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
 const ERROR_IO_PENDING: u32 = 997;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
+const INFINITE: u32 = u32::MAX;
 
 const MAX_PAYLOAD_LIMIT: usize = 65536; // 64 KB safety limit to prevent malformed buffer inflation
 
@@ -83,6 +84,8 @@ extern "system" {
     ) -> Handle;
 
     fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    fn WaitForMultipleObjects(count: u32, handles: *const Handle, wait_all: i32, milliseconds: u32) -> u32;
+    fn SetEvent(handle: Handle) -> i32;
 
     fn WriteFile(
         file: Handle,
@@ -389,7 +392,7 @@ impl PanoramaDevice {
         self.read_chunk_until(chunk, timeout, None, None)
     }
 
-    fn read_chunk_until(&self, chunk: &mut [u8], timeout: Duration, stop: Option<&AtomicBool>, armed: Option<&mpsc::SyncSender<()>>) -> Result<usize, DeviceError> {
+    fn read_chunk_until(&self, chunk: &mut [u8], timeout: Duration, stop: Option<&StopEvent>, armed: Option<&mpsc::SyncSender<()>>) -> Result<usize, DeviceError> {
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
         if event.is_null() {
             return Err(DeviceError::ReadFailed(unsafe { GetLastError() }));
@@ -415,12 +418,13 @@ impl PanoramaDevice {
             let err = unsafe { GetLastError() };
             if err == ERROR_IO_PENDING {
                 if let Some(ready) = armed { let _ = ready.try_send(()); }
-                // Poll cancellation without cancelling the outstanding idle IN.
-                let wait = loop {
-                    let wait = unsafe { WaitForSingleObject(event, if stop.is_some() { 100 } else { timeout.as_millis() as u32 }) };
-                    if wait != WAIT_TIMEOUT || stop.is_none() || stop.unwrap().load(Ordering::SeqCst) { break wait; }
+                let wait = match stop {
+                    Some(stop) => unsafe {
+                        WaitForMultipleObjects(2, [event, stop.0].as_ptr(), 0, INFINITE)
+                    },
+                    None => unsafe { WaitForSingleObject(event, timeout.as_millis() as u32) },
                 };
-                if wait == WAIT_TIMEOUT {
+                if wait == WAIT_TIMEOUT || (stop.is_some() && wait == WAIT_OBJECT_0 + 1) {
                     unsafe {
                         CancelIoEx(self.handle, &mut overlapped);
                         let mut transferred = 0u32;
@@ -476,21 +480,41 @@ impl Drop for PanoramaDevice {
 pub struct DisplaySession {
     device: Arc<PanoramaDevice>,
     input: mpsc::Receiver<Result<Vec<u8>, DeviceError>>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopEvent>,
     reader: Option<std::thread::JoinHandle<()>>,
+}
+
+struct StopEvent(Handle);
+// An unnamed Win32 event can be waited on and signaled from different threads.
+unsafe impl Send for StopEvent {}
+unsafe impl Sync for StopEvent {}
+
+impl StopEvent {
+    fn new() -> Result<Self, DeviceError> {
+        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+        if event.is_null() { Err(DeviceError::ReadFailed(unsafe { GetLastError() })) } else { Ok(Self(event)) }
+    }
+
+    fn signaled(&self) -> bool {
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for StopEvent {
+    fn drop(&mut self) { unsafe { CloseHandle(self.0); } }
 }
 
 impl DisplaySession {
     pub fn open_first() -> Result<Self, DeviceError> {
         let device = Arc::new(PanoramaDevice::open_first()?);
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(StopEvent::new()?);
         let (tx, input) = mpsc::sync_channel(16);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let source = Arc::clone(&device);
         let cancelled = Arc::clone(&stop);
         let reader = std::thread::spawn(move || {
             let mut buffered = Vec::new();
-            while !cancelled.load(Ordering::SeqCst) {
+            while !cancelled.signaled() {
                 let mut chunk = [0u8; 512];
                 match source.read_chunk_until(&mut chunk, Duration::ZERO, Some(&cancelled), Some(&ready_tx)) {
                     Ok(0) => { std::thread::sleep(Duration::from_millis(20)); }
@@ -504,7 +528,7 @@ impl DisplaySession {
                             }
                         }
                     }
-                    Err(_) if cancelled.load(Ordering::SeqCst) => break,
+                    Err(_) if cancelled.signaled() => break,
                     Err(e) => { let _ = tx.try_send(Err(e)); return; }
                 }
             }
@@ -531,7 +555,11 @@ impl DisplaySession {
         self.write_frame(&lumien_protocol::encode_get_user_config_frame(), timeout)
             .map_err(|e| format!("Read display settings write: {e:?}"))?;
         let payload = self.read_frame(timeout).map_err(|e| format!("Read display settings: {e:?}"))?;
-        lumien_protocol::parse_display_power_response(&payload).map_err(|e| format!("Invalid display settings: {e:?}"))
+        match lumien_protocol::parse_device_response(&lumien_protocol::encode_frame(&payload)) {
+            Ok(DeviceResponse::DisplayPower(power)) => Ok(power),
+            Ok(DeviceResponse::Error { code, why }) => Err(format!("Read display settings rejected: {code} {why}").trim_end().into()),
+            other => Err(format!("Invalid display settings response: {other:?}")),
+        }
     }
 
     pub fn set_display_power(&mut self, power: lumien_protocol::DisplayPower) -> Result<(), String> {
@@ -539,9 +567,11 @@ impl DisplaySession {
         self.write_frame(&lumien_protocol::encode_display_power_frame(power.enabled, power.brightness), timeout)
             .map_err(|e| format!("Display power write: {e:?}"))?;
         let payload = self.read_frame(timeout).map_err(|e| format!("Display power response: {e:?}"))?;
-        let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&payload))
-            .map_err(|e| format!("Invalid display power response: {e:?}"))?;
-        if ack.ok { Ok(()) } else { Err("Display rejected the power change".into()) }
+        match lumien_protocol::parse_device_response(&lumien_protocol::encode_frame(&payload)) {
+            Ok(DeviceResponse::Ack(ack)) if ack.ok => Ok(()),
+            Ok(DeviceResponse::Error { code, why }) => Err(format!("Display power change rejected: {code} {why}").trim_end().into()),
+            other => Err(format!("Invalid display power response: {other:?}")),
+        }
     }
 
     /// Transmits a media file to device eMMC via FileTransmitBegin (400) -> FileTransmitData (401) -> FileTransmitEnd (402).
@@ -555,7 +585,7 @@ impl DisplaySession {
 
 impl Drop for DisplaySession {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        unsafe { SetEvent(self.stop.0); }
         if let Some(reader) = self.reader.take() { let _ = reader.join(); }
     }
 }

@@ -14,7 +14,9 @@ use std::{
 pub struct State {
     monitor_on: bool,
     suspended: bool,
+    display_reported: bool,
     pub resumes: u64,
+    pub transitions: u64,
 }
 
 impl State {
@@ -26,9 +28,12 @@ impl State {
 static STATE: Mutex<State> = Mutex::new(State {
     monitor_on: true,
     suspended: false,
+    display_reported: false,
     resumes: 0,
+    transitions: 0,
 });
 static CHANGED: Condvar = Condvar::new();
+const WAKE_MARKER: &str = "monitor-power-restore";
 
 pub fn state() -> State {
     *STATE.lock().unwrap()
@@ -54,42 +59,38 @@ pub fn stop(flag: &AtomicBool) {
 }
 
 pub fn needs_wake(config: &Path) -> bool {
-    config.join("monitor-power-restore").exists()
+    config.join(WAKE_MARKER).exists()
 }
 
-pub fn sync(dev: &mut DisplaySession, config: &Path, on: bool) -> Result<(), String> {
-    let path = config.join("monitor-power-restore");
-    let previous = match std::fs::read_to_string(&path) {
-        Ok(text) => Some(
-            text.trim()
-                .parse::<u8>()
-                .ok()
-                .filter(|v| *v <= 100)
-                .ok_or("Invalid saved display brightness")?,
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+pub fn sync(dev: &mut DisplaySession, config: &Path, on: bool) -> Result<bool, String> {
+    let path = config.join(WAKE_MARKER);
+    let ours = match std::fs::metadata(&path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(format!("Read display power recovery state: {e}")),
     };
-    if on && previous.is_none() {
-        return Ok(());
+    if on && !ours {
+        return Ok(true);
     }
+    crate::ensure_usb_channel_available()?;
     let current = dev.display_power()?;
-    if !on && !current.enabled {
-        return Ok(());
-    }
     if state().on() != on {
-        return Ok(());
+        return Ok(false);
     }
-    let brightness = previous.unwrap_or(current.brightness);
-    if previous.is_none() {
-        std::fs::create_dir_all(config).map_err(|e| e.to_string())?;
-        crate::layout_files::atomic_write(&path, &brightness.to_string())?;
-    }
-    let target = DisplayPower {
-        enabled: on,
-        brightness,
-    };
-    if current != target {
+    if current.enabled != on {
+        crate::ensure_usb_channel_available()?;
+        if state().on() != on {
+            return Ok(false);
+        }
+        // The marker records ownership of the off state. Brightness stays on the device.
+        if !on && !ours {
+            std::fs::create_dir_all(config).map_err(|e| e.to_string())?;
+            crate::layout_files::atomic_write(&path, "off")?;
+        }
+        let target = DisplayPower {
+            enabled: on,
+            ..current
+        };
         dev.set_display_power(target)?;
         log_change(target);
     }
@@ -97,7 +98,7 @@ pub fn sync(dev: &mut DisplaySession, config: &Path, on: bool) -> Result<(), Str
         std::fs::remove_file(path)
             .map_err(|e| format!("Remove display power recovery state: {e}"))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn log_change(target: DisplayPower) {
@@ -168,8 +169,12 @@ unsafe extern "system" fn on_display_event(
         _ => return 0,
     };
     let mut state = STATE.lock().unwrap();
+    if !state.suspended {
+        state.display_reported = true;
+    }
     if state.monitor_on != monitor_on {
         state.monitor_on = monitor_on;
+        state.transitions = state.transitions.wrapping_add(1);
         CHANGED.notify_all();
     }
     0
@@ -181,12 +186,14 @@ unsafe extern "system" fn on_sleep_event(
     _setting: *mut c_void,
 ) -> u32 {
     const PBT_APMSUSPEND: u32 = 4;
+    const PBT_APMRESUMESUSPEND: u32 = 7;
     const PBT_APMRESUMEAUTOMATIC: u32 = 0x12;
     let mut state = STATE.lock().unwrap();
     let old = *state;
     match kind {
         PBT_APMSUSPEND => {
             state.suspended = true;
+            state.display_reported = false;
             // If the display subscription failed, there will be no display-on event on wake.
             if !context.is_null() {
                 state.monitor_on = false;
@@ -196,9 +203,19 @@ unsafe extern "system" fn on_sleep_event(
             state.suspended = false;
             state.resumes = state.resumes.wrapping_add(1);
         }
+        PBT_APMRESUMESUSPEND => {
+            if state.suspended {
+                state.resumes = state.resumes.wrapping_add(1);
+            }
+            state.suspended = false;
+            if !state.display_reported {
+                state.monitor_on = true;
+            }
+        }
         _ => {}
     }
     if *state != old {
+        state.transitions = state.transitions.wrapping_add(1);
         CHANGED.notify_all();
     }
     0
@@ -279,7 +296,19 @@ mod tests {
         assert!(!state().on());
         sleep(0x12);
         assert!(!state().on());
-        display(1);
+        let resumed = state().resumes;
+        sleep(7);
         assert!(state().on());
+        assert_eq!(state().resumes, resumed);
+        sleep(4);
+        sleep(7);
+        assert!(state().on());
+        assert_eq!(state().resumes, resumed + 1);
+        sleep(4);
+        sleep(0x12);
+        display(0);
+        sleep(7);
+        assert!(!state().on());
+        display(1);
     }
 }
