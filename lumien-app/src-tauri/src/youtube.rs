@@ -43,6 +43,29 @@ fn run(command: &mut Command, dir: &Path, stage: &str) -> Result<(), String> {
     }
 }
 
+pub fn encode_for_lcd(source: &Path, output: &Path, ffmpeg: &Path, mp4: bool) -> Result<(), String> {
+    let dir = output.parent().ok_or("Missing video output directory")?;
+    let partial = output.with_extension("partial");
+    let mut command = Command::new(ffmpeg);
+    command.args(["-v", "error", "-y", "-protocol_whitelist", "file"]);
+    if mp4 {
+        command.args(["-f", "mov"]);
+    }
+    // The bitrate and duration cap keep uploads under 128 MiB.
+    command.arg("-i").arg(source)
+        .args(["-map", "0:V:0", "-an", "-vf", "scale=2240:1080:force_original_aspect_ratio=increase,crop=2240:1080,setsar=1",
+            "-r", "30", "-t", "300", "-c:v", "libx264", "-profile:v", "main", "-level:v", "4.1",
+            "-pix_fmt", "yuv420p", "-preset", "fast", "-b:v", "3M", "-maxrate", "3400k", "-bufsize", "6800k",
+            "-bf", "0", "-g", "1", "-f", "h264"])
+        .arg(&partial).stdout(Stdio::null());
+    run(&mut command, dir, "Converting for LCD")?;
+    let size = fs::metadata(&partial).map_err(|e| e.to_string())?.len();
+    if size == 0 || size > 128 * 1024 * 1024 {
+        return Err("Converted video must be nonempty and at most 128 MiB".into());
+    }
+    fs::rename(&partial, output).map_err(|e| e.to_string())
+}
+
 pub fn prepare(link: &str, cache: &Path, downloader: &Path, ffmpeg: &Path) -> Result<PathBuf, String> {
     let id = video_id(link)?;
     let url = format!("https://www.youtube.com/watch?v={id}");
@@ -65,14 +88,7 @@ pub fn prepare(link: &str, cache: &Path, downloader: &Path, ffmpeg: &Path) -> Re
         let size = fs::metadata(&source).map_err(|_| "Download missing or exceeds 128 MB")?.len();
         if size == 0 || size > 128 * 1024 * 1024 { return Err("Downloaded video exceeds 128 MB".into()); }
         let output = dir.join(format!("youtube_{id}.mp4.h264_2240x1080"));
-        // maxrate 3.4 Mbit/s x 300 s + VBV buffer stays under the 128 MiB upload cap.
-        let partial = output.with_extension("partial");
-        run(Command::new(ffmpeg).args(["-v", "error", "-y", "-i"]).arg(&source)
-            .args(["-map", "0:v:0", "-an", "-vf", "scale=2240:1080:force_original_aspect_ratio=increase,crop=2240:1080,setsar=1", "-r", "30", "-t", "300", "-c:v", "libx264", "-profile:v", "main", "-level:v", "4.1", "-pix_fmt", "yuv420p", "-preset", "fast", "-b:v", "3M", "-maxrate", "3400k", "-bufsize", "6800k", "-bf", "0", "-g", "1", "-f", "h264"])
-            .arg(&partial).stdout(Stdio::null()), &dir, "Converting for LCD")?;
-        let size = fs::metadata(&partial).map_err(|e| e.to_string())?.len();
-        if size == 0 || size > 128 * 1024 * 1024 { return Err("Converted video exceeds 128 MB".into()); }
-        fs::rename(&partial, &output).map_err(|e| e.to_string())?;
+        encode_for_lcd(&source, &output, ffmpeg, false)?;
         let _ = fs::remove_file(source);
         Ok(output)
     })();

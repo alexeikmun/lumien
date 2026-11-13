@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { sample, parseScene, logical, geometry, createWidget, emptyScene } from './scene.ts';
 import { RealDeviceAdapter } from './adapter.ts';
-import { historyReducer, initialHistory, withTelemetry, takeStartupScene } from './editor.ts';
+import { historyReducer, initialHistory, withTelemetry, moveWidgets, takeStartupScene } from './editor.ts';
 import { formatMetric, sensors } from './metrics.ts';
 
 test('native coordinates invert zoom and pan', () => {
@@ -10,6 +10,20 @@ test('native coordinates invert zoom and pan', () => {
     const r = { left: 230, top: 170, width: 2240 * scale, height: 1080 * scale };
     assert.deepEqual(logical(230 + 1260 * scale, 170 + 80 * scale, r), { x: 1260, y: 80 });
   }
+});
+
+test('group movement preserves spacing, respects canvas edges and leaves locked widgets in place', () => {
+  const scene = emptyScene();
+  const first = { ...createWidget('Text', 100, 20), width: 200 };
+  const second = { ...createWidget('Text'), x: 1900, y: 100, width: 300 };
+  const locked = { ...createWidget('Text', 0, 0), locked: true };
+  scene.widgets = [first, second, locked];
+  const moved = moveWidgets(scene, new Set(scene.widgets.map(w => w.id)), 200, -50);
+  assert.deepEqual(moved.widgets.map(w => [w.x, w.y]), [[140, 0], [1940, 80], [0, 0]]);
+  assert.equal(moved.widgets[2], locked);
+  const history = historyReducer(initialHistory(scene), { type: 'commit', scene: moved });
+  assert.equal(history.past.length, 1);
+  assert.equal(historyReducer(history, { type: 'undo' }).scene, scene);
 });
 
 test('layout roundtrip, bounds and trust boundary', () => {

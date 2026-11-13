@@ -15,6 +15,7 @@ use lumien_protocol::{
     TextAlign, CANVAS_HEIGHT, CANVAS_WIDTH,
 };
 use serde::{Deserialize, Serialize};
+use tauri_plugin_dialog::DialogExt;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -479,6 +480,20 @@ async fn list_downloaded_videos(app: tauri::AppHandle) -> Result<Vec<video_galle
     tauri::async_runtime::spawn_blocking(move || {
         let config = app.path().app_config_dir().map_err(|e| e.to_string())?;
         video_gallery::list(&config.join("youtube"), presets::find_ffmpeg(&config).as_deref())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn import_mp4(window: tauri::WebviewWindow) -> Result<bool, String> {
+    let config = window.app_handle().path().app_config_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = window.dialog().file().set_parent(&window)
+            .set_title("Import MP4 background").add_filter("MP4 video", &["mp4"]).blocking_pick_file();
+        let Some(selected) = selected else { return Ok(false) };
+        let source = selected.into_path().map_err(|e| e.to_string())?;
+        let ffmpeg = presets::find_ffmpeg(&config).ok_or("FFmpeg is required to import MP4 backgrounds")?;
+        video_gallery::import_mp4(&config.join("youtube"), &source, &ffmpeg)?;
+        Ok(true)
     }).await.map_err(|e| e.to_string())?
 }
 
@@ -1148,6 +1163,7 @@ fn main() {
             get_active_preset,
             set_display_background,
             play_youtube,
+            import_mp4,
             list_downloaded_videos,
             play_downloaded_video,
             remove_downloaded_video,

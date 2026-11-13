@@ -17,7 +17,7 @@ import {
 } from './scene';
 import { device } from './adapter';
 import { invoke } from '@tauri-apps/api/core';
-import { historyReducer, initialHistory, withTelemetry, takeStartupScene } from './editor';
+import { historyReducer, initialHistory, withTelemetry, moveWidgets, takeStartupScene } from './editor';
 import { sensors, isNetwork, metricMax, formatMetric } from './metrics';
 import { Icon, sensorIcon } from './icons';
 import './style.css';
@@ -139,10 +139,10 @@ const readStored = <T extends string>(key: string, allowed: readonly T[], fallba
 };
 const store = (key: string, value: string) => { try { localStorage.setItem(key, value); } catch { /* storage unavailable */ } };
 
-type DownloadedVideo = { id: string; title: string; duration: number; bytes: number; thumbnail: string };
+type DownloadedVideo = { id: string; title: string; duration: number | null; bytes: number; thumbnail: string };
 type LayoutOption = { path: string; name: string };
 type BgTab = 'presets' | 'solid' | 'video';
-const isDownloadedVideo = (filename?: string) => /^youtube_[\w-]{11}\.mp4\.h264_2240x1080$/.test(filename ?? '');
+const isLibraryVideo = (filename?: string) => /^(?:youtube_[\w-]{11}|local_\d{1,39})\.mp4\.h264_2240x1080$/.test(filename ?? '');
 
 function withBackgroundFile(layout: Scene, filename: string): Scene {
   const solid = /^solid_([0-9a-f]{6})\.mp4\.h264_2240x1080$/i.exec(filename);
@@ -161,7 +161,7 @@ function App() {
   const [playingVideo, setPlayingVideo] = useState<string | null>(null);
   const [layouts, setLayouts] = useState<LayoutOption[]>([]);
   const [{ scene, past, future }, dispatch] = useReducer(historyReducer, undefined, () => initialHistory(sample()));
-  const [selected, select] = useState<string | null>(null),
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set()),
     [saved, setSaved] = useState<string | null>(null),
     [filePath, setFilePath] = useState<string | null>(null),
     [fileBusy, setFileBusy] = useState(desktop),
@@ -216,10 +216,13 @@ function App() {
   const startupApply = useRef<Scene | null>(null);
   const viewport = useRef<HTMLDivElement>(null),
     canvas = useRef<HTMLDivElement>(null);
-  const gesture = useRef<{ scene: Scene; id: string; point: { x: number; y: number }; resize: boolean } | null>(null),
+  const gesture = useRef<{
+    scene: Scene; next: Scene; id: string; point: { x: number; y: number }; pointerId: number; moveIds?: ReadonlySet<string>;
+  } | null>(null),
     panning = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
 
-  const w = scene.widgets.find((v) => v.id === selected),
+  const selection = scene.widgets.filter(v => selected.has(v.id));
+  const w = selection.length === 1 ? selection[0] : undefined,
     scale = fit * zoom,
     dirty = !starting && saved !== JSON.stringify(scene),
     previewScene = withTelemetry(scene, readings),
@@ -243,7 +246,7 @@ function App() {
           if (file) replaceDocument(restored, file.path, false);
           else dispatch({ type: 'replace', scene: restored });
           startupApply.current = restored;
-          if (isDownloadedVideo(restored.bgFile) && restored.bgType !== 'solid') {
+          if (isLibraryVideo(restored.bgFile) && restored.bgType !== 'solid') {
             setBgSubtab('video');
           } else if (restored.bgType === 'solid') {
             setBgSubtab('solid');
@@ -286,7 +289,7 @@ function App() {
       const video = downloadedVideos.find((item) => item.id.endsWith('/' + scene.bgFile));
       setActivePresetFile(scene.bgFile);
       setPreviewBackground(preset?.thumbnail ?? video?.thumbnail ?? '');
-      if (!preset && !isDownloadedVideo(scene.bgFile) && !presetsLoading && presets.length) setStatus(`Background preview unavailable for saved media: ${scene.bgFile}. Apply will still send its saved filename to the LCD.`);
+      if (!preset && !isLibraryVideo(scene.bgFile) && !presetsLoading && presets.length) setStatus(`Background preview unavailable for saved media: ${scene.bgFile}. Apply will still send its saved filename to the LCD.`);
       return;
     }
     const active = presets.find((item) => item.is_active);
@@ -417,7 +420,7 @@ function App() {
       setPlayingVideo(null);
     } else if (layout.bgFile) {
       await invoke('set_display_background', { fileName: layout.bgFile });
-      setPlayingVideo(isDownloadedVideo(layout.bgFile) ? layout.bgFile : null);
+      setPlayingVideo(isLibraryVideo(layout.bgFile) ? layout.bgFile : null);
     }
   }
 
@@ -433,14 +436,27 @@ function App() {
     finally { setYoutubeBusy(false); }
   });
 
+  const importMp4 = () => exclusive(async () => {
+    setYoutubeBusy(true);
+    setStatus('Importing MP4 for the display…');
+    try {
+      const imported = await invoke<boolean>('import_mp4');
+      setStatus(imported ? 'MP4 imported. Select it in the video library to play.' : 'Import cancelled.');
+    } catch (error) {
+      setStatus('MP4 import failed: ' + String(error));
+    } finally {
+      setYoutubeBusy(false);
+    }
+  });
+
   async function removeVideo(video: DownloadedVideo) {
-    if (busy || !window.confirm(`Remove “${video.title}” and all duplicate downloads from this computer?`)) return;
+    if (busy || !window.confirm(`Remove “${video.title}” from Lumien’s video library?`)) return;
     setBusy(true);
     try {
       await invoke('remove_downloaded_video', { id: video.id });
       setDownloadedVideos(items => items.filter(item => item.id !== video.id));
       if (video.id.endsWith('/' + playingVideo)) setPlayingVideo(null);
-      setStatus('Downloaded video and duplicate copies removed.');
+      setStatus('Video removed from the library.');
     } catch (error) { setStatus('Could not remove video: ' + String(error)); }
     finally { setBusy(false); }
   }
@@ -525,6 +541,19 @@ function App() {
     dispatch({ type: 'commit', scene: next });
   }
 
+  function select(id: string | null, toggle = false) {
+    if (id === null || !toggle) {
+      setSelected(new Set(id === null ? [] : [id]));
+      return;
+    }
+    setSelected(previous => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   const withWidget = (base: Scene, id: string, p: Partial<Widget>): Scene =>
     ({ ...base, widgets: base.widgets.map((v) => (v.id === id ? geometry({ ...v, ...p }) : v)) });
 
@@ -558,21 +587,38 @@ function App() {
     onCommit: (v?: number) => endEdit(v === undefined ? undefined : { [key]: v } as Partial<Widget>),
   });
 
-  function undo() { dispatch({ type: 'undo' }); }
-  function redo() { dispatch({ type: 'redo' }); }
+  function restoreHistory(type: 'undo' | 'redo', next?: Scene) {
+    if (!next) return;
+    dispatch({ type });
+    setSelected(previous => new Set(next.widgets.filter(v => previous.has(v.id)).map(v => v.id)));
+  }
+
+  function undo() { restoreHistory('undo', past.at(-1)); }
+  function redo() { restoreHistory('redo', future[0]); }
 
   function duplicate() {
-    if (!w) return;
-    const copy = geometry({ ...w, id: crypto.randomUUID(), name: w.name + ' copy', x: w.x + 20, y: w.y + 20, locked: false });
-    commit({ ...scene, widgets: [...scene.widgets, copy] });
-    select(copy.id);
+    if (!selection.length) return;
+    if (scene.widgets.length + selection.length > 100) {
+      setStatus('Editor limit: 100 widgets');
+      return;
+    }
+    const copies = selection.map(v => ({
+      ...v, id: crypto.randomUUID(), name: v.name.slice(0, 115) + ' copy', locked: false,
+    }));
+    const ids = new Set(copies.map(v => v.id));
+    commit(moveWidgets({ ...scene, widgets: [...scene.widgets, ...copies] }, ids, 20, 20));
+    setSelected(ids);
   }
 
   function remove() {
-    if (w && !w.locked) {
-      commit({ ...scene, widgets: scene.widgets.filter((v) => v.id !== w.id) });
-      select(null);
-    }
+    const widgets = scene.widgets.filter(v => !selected.has(v.id) || v.locked);
+    if (widgets.length === scene.widgets.length) return;
+    commit({ ...scene, widgets });
+    setSelected(new Set(selection.filter(v => v.locked).map(v => v.id)));
+  }
+
+  function setSelectionFlag(key: 'visible' | 'locked', value: boolean) {
+    commit({ ...scene, widgets: scene.widgets.map(v => selected.has(v.id) ? { ...v, [key]: value } : v) });
   }
 
   function insert(widget: Widget) {
@@ -713,7 +759,7 @@ function App() {
 
   useEffect(() => {
     function key(e: KeyboardEvent) {
-      if (pending || fileBusy) return;
+      if (pending || fileBusy || gesture.current) return;
       const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
       if (mod && (k === 's' || k === 'n')) {
         e.preventDefault();
@@ -729,8 +775,8 @@ function App() {
       if (mod && k === '-') { e.preventDefault(); setZoom(z => Math.max(0.25, z / 1.25)); return; }
       if (mod && k === '0') { e.preventDefault(); setZoom(1); setPan({ x: 0, y: 0 }); return; }
       if (e.key === 'Escape') { select(null); return; }
-      if (e.key === 'Delete' || e.key === 'Backspace') { remove(); return; }
-      if (!w || w.locked) return;
+      if (!selection.length) return;
+      if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); remove(); return; }
       const n = e.shiftKey ? 10 : 1;
       const d: Record<string, [number, number]> = {
         ArrowLeft: [-n, 0],
@@ -740,7 +786,7 @@ function App() {
       };
       if (d[e.key]) {
         e.preventDefault();
-        patch({ x: w.x + d[e.key][0], y: w.y + d[e.key][1] });
+        commit(moveWidgets(scene, selected, ...d[e.key]));
       }
     }
     window.addEventListener('keydown', key);
@@ -870,8 +916,8 @@ function App() {
                   {scene.widgets.length === 0 && <p className="hint">Nothing on the display yet. Add a metric or text above.</p>}
                   <ul className="layer-list">
                     {[...scene.widgets].reverse().map((v) => (
-                      <li key={v.id} className={`layer ${selected === v.id ? 'active' : ''} ${v.visible ? '' : 'hidden'}`}>
-                        <button className="layer-main" onClick={() => select(v.id)} aria-current={selected === v.id}>
+                      <li key={v.id} className={`layer ${selected.has(v.id) ? 'active' : ''} ${v.visible ? '' : 'hidden'}`}>
+                        <button className="layer-main" onClick={(e) => select(v.id, e.ctrlKey || e.metaKey)} aria-pressed={selected.has(v.id)}>
                           <Icon name={v.kind === 'Text' ? 'text' : sensorIcon(v.binding)} size={14} />
                           <span>{v.name}</span>
                         </button>
@@ -984,6 +1030,10 @@ function App() {
                 {bgSubtab === 'video' && (
                   <>
                     <div className="video-form">
+                      <button className="block" disabled={!desktop || busy} onClick={() => void importMp4()}>
+                        <Icon name="file" /> Import MP4
+                      </button>
+                      <p className="hint">Imports the first 5 minutes, without audio.</p>
                       <label className="field" htmlFor="youtube-url">
                         YouTube link
                         <input id="youtube-url" type="url" placeholder="https://www.youtube.com/watch?v=…" value={youtubeUrl} onChange={e => setYoutubeUrl(e.target.value)} />
@@ -994,10 +1044,10 @@ function App() {
                       </button>
                       <p className="hint">Up to 5 minutes, silent, cropped to fill the panel behind your widgets.</p>
                     </div>
-                    <h2 className="section-title" style={{ marginTop: 18 }}>Downloaded <span className="count">{downloadedVideos.length}</span></h2>
+                    <h2 className="section-title" style={{ marginTop: 18 }}>Video library <span className="count">{downloadedVideos.length}</span></h2>
                     {galleryLoading && <p className="hint" role="status">Loading videos…</p>}
                     {galleryError && <p className="hint error" role="alert">{galleryError}</p>}
-                    {!galleryLoading && !galleryError && downloadedVideos.length === 0 && <p className="hint">Videos you play appear here for quick replay.</p>}
+                    {!galleryLoading && !galleryError && downloadedVideos.length === 0 && <p className="hint">Import an MP4 or play a YouTube video to add it here.</p>}
                     <div className="video-list">
                       {downloadedVideos.map(video => {
                         const isPlaying = playingVideo !== null && video.id.endsWith('/' + playingVideo);
@@ -1009,11 +1059,11 @@ function App() {
                             {video.thumbnail ? <img className="thumb" src={video.thumbnail} alt="" /> : <span className="thumb empty"><Icon name="play" size={22} /></span>}
                             <span className="preset-meta">
                               <strong>{video.title}</strong>
-                              <span className="tag">{Math.floor(video.duration / 60)}:{String(Math.floor(video.duration % 60)).padStart(2, '0')} · {(video.bytes / 1048576).toFixed(1)} MB{isPlaying ? ' · Playing' : ''}</span>
+                              <span className="tag">{video.duration !== null && `${Math.floor(video.duration / 60)}:${String(Math.floor(video.duration % 60)).padStart(2, '0')} · `}{(video.bytes / 1048576).toFixed(1)} MB{isPlaying ? ' · Playing' : ''}</span>
                             </span>
                           </button>
                           <button type="button" className="video-delete" disabled={busy}
-                            aria-label={`Remove ${video.title} and duplicate downloads`} title="Remove downloaded video"
+                            aria-label={`Remove ${video.title} from the video library`} title="Remove video"
                             onClick={() => void removeVideo(video)}>
                             <Icon name="trash" size={15} />
                           </button>
@@ -1092,32 +1142,30 @@ function App() {
                 return;
               }
               const g = gesture.current;
-              if (!g) return;
+              if (!g || g.pointerId !== e.pointerId) return;
               const p = point(e.clientX, e.clientY),
                 original = g.scene.widgets.find((a) => a.id === g.id)!;
               const q = (v: number) => (snap ? Math.round(v / 20) * 20 : Math.round(v));
-              const next = geometry({
-                ...original,
-                ...(g.resize
-                  ? { width: q(original.width + p.x - g.point.x), height: q(original.height + p.y - g.point.y) }
-                  : { x: q(original.x + p.x - g.point.x), y: q(original.y + p.y - g.point.y) }),
-              });
-              dispatch({ type: 'preview', scene: { ...g.scene, widgets: g.scene.widgets.map((a) => (a.id === g.id ? next : a)) } });
+              const dx = p.x - g.point.x, dy = p.y - g.point.y;
+              g.next = g.moveIds
+                ? moveWidgets(g.scene, g.moveIds, dx ? q(original.x + dx) - original.x : 0, dy ? q(original.y + dy) - original.y : 0)
+                : withWidget(g.scene, g.id, { width: q(original.width + dx), height: q(original.height + dy) });
+              dispatch({ type: 'preview', scene: g.next });
             }}
-            onPointerUp={() => {
-              if (gesture.current) {
-                const before = gesture.current.scene;
-                if (JSON.stringify(before) !== JSON.stringify(scene)) {
-                  dispatch({ type: 'commit', scene, before });
-                }
+            onPointerUp={(e) => {
+              const g = gesture.current;
+              if (g?.pointerId === e.pointerId) {
                 gesture.current = null;
+                dispatch({ type: 'commit', scene: g.next, before: g.scene });
               }
               panning.current = null;
               setIsPanning(false);
             }}
-            onPointerCancel={() => {
-              if (gesture.current) dispatch({ type: 'preview', scene: gesture.current.scene });
-              gesture.current = null;
+            onPointerCancel={(e) => {
+              if (gesture.current?.pointerId === e.pointerId) {
+                dispatch({ type: 'preview', scene: gesture.current.scene });
+                gesture.current = null;
+              }
               panning.current = null;
               setIsPanning(false);
             }}
@@ -1145,26 +1193,32 @@ function App() {
                 .map((v) => (
                   <div
                     key={v.id}
-                    className={`widget-box ${selected === v.id ? 'selected' : ''} ${v.locked ? 'locked' : ''}`}
+                    className={`widget-box ${selected.has(v.id) ? 'selected' : ''} ${v.locked ? 'locked' : ''}`}
                     style={{ left: v.x, top: v.y, width: v.width, height: v.height }}
                     onPointerDown={(e) => {
-                      if (e.button !== 0 || e.altKey) return;
+                      if (e.button !== 0 || e.altKey || gesture.current) return;
                       e.stopPropagation();
-                      select(v.id);
+                      if (e.ctrlKey || e.metaKey) {
+                        select(v.id, true);
+                        return;
+                      }
+                      const moveIds = selected.has(v.id) ? selected : new Set([v.id]);
+                      if (!selected.has(v.id)) setSelected(moveIds);
                       if (v.locked) return;
-                      gesture.current = { scene, id: v.id, point: point(e.clientX, e.clientY), resize: false };
+                      gesture.current = { scene, next: scene, id: v.id, point: point(e.clientX, e.clientY), pointerId: e.pointerId, moveIds };
                       viewport.current!.setPointerCapture(e.pointerId);
                     }}
                   >
                     <Preview w={previewScene.widgets.find(a => a.id === v.id)!} readings={readings} cpuTempStatus={cpuTempStatus} />
-                    {selected === v.id && !v.locked && (
+                    {w?.id === v.id && !v.locked && (
                       <button
                         aria-label="Resize selected widget"
                         className="resize"
                         style={{ width: 14 / scale, height: 14 / scale }}
                         onPointerDown={(e) => {
+                          if (e.button !== 0 || e.altKey || e.ctrlKey || e.metaKey || gesture.current) return;
                           e.stopPropagation();
-                          gesture.current = { scene, id: v.id, point: point(e.clientX, e.clientY), resize: true };
+                          gesture.current = { scene, next: scene, id: v.id, point: point(e.clientX, e.clientY), pointerId: e.pointerId };
                           viewport.current!.setPointerCapture(e.pointerId);
                         }}
                       />
@@ -1178,7 +1232,7 @@ function App() {
 
           <footer className="statusbar">
             <span className={`status ${tone}`} role="status" title={status}><span className="dot" /><span>{status}</span></span>
-            <span className="coords">{w ? `${w.x}, ${w.y} · ${w.width} × ${w.height}` : ''}</span>
+            <span className="coords">{w ? `${w.x}, ${w.y} · ${w.width} × ${w.height}` : selection.length > 1 ? `${selection.length} selected` : ''}</span>
             <span className="keys">Scroll to zoom · drag empty space to pan</span>
           </footer>
         </section>
@@ -1266,11 +1320,31 @@ function App() {
                 </section>
               </div>
             </>
+          ) : selection.length > 1 ? (
+            <div className="sidebar-scroll">
+              <section className="section">
+                <h3 className="section-title">{selection.length} widgets selected</h3>
+                <p className="hint">Drag or use arrow keys to move unlocked widgets together.</p>
+                <div className="actions">
+                  <button onClick={duplicate} title="Ctrl+D"><Icon name="copy" size={14} /> Duplicate</button>
+                  <button onClick={() => setSelectionFlag('visible', !selection.every(v => v.visible))}>
+                    {selection.every(v => v.visible) ? 'Hide all' : 'Show all'}
+                  </button>
+                  <button onClick={() => setSelectionFlag('locked', !selection.every(v => v.locked))}>
+                    {selection.every(v => v.locked) ? 'Unlock all' : 'Lock all'}
+                  </button>
+                  <button className="danger" disabled={selection.every(v => v.locked)} onClick={remove} title="Delete unlocked widgets">
+                    <Icon name="trash" size={14} /> Delete unlocked
+                  </button>
+                </div>
+              </section>
+            </div>
           ) : (
             <div className="empty-state">
               <span className="kind-badge"><Icon name="pointer" size={20} /></span>
               <p>Select a widget on the display to edit it.</p>
               <div className="shortcuts">
+                <kbd>Ctrl click</kbd><span>Add or remove selection</span>
                 <kbd>Arrows</kbd><span>Nudge (Shift ×10)</span>
                 <kbd>Ctrl D</kbd><span>Duplicate</span>
                 <kbd>Delete</kbd><span>Remove</span>

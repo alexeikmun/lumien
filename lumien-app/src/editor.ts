@@ -38,6 +38,24 @@ export function withTelemetry(scene: Scene, readings: Record<string, number | nu
   }) };
 }
 
+export function moveWidgets(scene: Scene, ids: ReadonlySet<string>, dx: number, dy: number): Scene {
+  const moving = scene.widgets.filter(w => ids.has(w.id) && !w.locked);
+  if (!moving.length) return scene;
+
+  const left = Math.min(...moving.map(w => w.x));
+  const top = Math.min(...moving.map(w => w.y));
+  const right = Math.max(...moving.map(w => w.x + w.width));
+  const bottom = Math.max(...moving.map(w => w.y + w.height));
+  const x = Math.max(-left, Math.min(scene.width - right, Math.round(dx)));
+  const y = Math.max(-top, Math.min(scene.height - bottom, Math.round(dy)));
+  if (!x && !y) return scene;
+
+  return {
+    ...scene,
+    widgets: scene.widgets.map(w => ids.has(w.id) && !w.locked ? { ...w, x: w.x + x, y: w.y + y } : w),
+  };
+}
+
 export function takeStartupScene(pending: { current: Scene | null }, current: Scene, ready: boolean): Scene | null {
   const restored = pending.current;
   if (restored && JSON.stringify(restored) !== JSON.stringify(current)) pending.current = null;
