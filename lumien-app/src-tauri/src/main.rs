@@ -2,6 +2,7 @@
 
 mod layout_files;
 mod cpu_temperature;
+mod monitor_power;
 mod youtube;
 mod video_gallery;
 mod presets;
@@ -240,17 +241,26 @@ struct SyncWorker {
 
 impl SyncWorker {
     fn start(dev: Option<DisplaySession>, restore: Arc<Restore>) -> Self {
+        Self::spawn(dev, restore, true)
+    }
+
+    fn idle(config_dir: Option<std::path::PathBuf>) -> Self {
+        let restore = Arc::new(Restore { frame: Vec::new(), config_dir, bindings: Vec::new() });
+        Self::spawn(None, restore, false)
+    }
+
+    fn spawn(dev: Option<DisplaySession>, restore: Arc<Restore>, recover_content: bool) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_restore = Arc::clone(&restore);
-        let thread = std::thread::spawn(move || run_sync_worker(&worker_stop, dev, &worker_restore));
+        let thread = std::thread::spawn(move || run_sync_worker(&worker_stop, dev, &worker_restore, recover_content));
         Self { stop, thread: Some(thread), restore }
     }
 }
 
 impl Drop for SyncWorker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        monitor_power::stop(&self.stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -400,54 +410,27 @@ fn get_cpu_temperature_status() -> Option<String> {
 }
 
 #[tauri::command(async)]
-fn clear_display() -> Result<String, String> {
+fn clear_display(app: tauri::AppHandle) -> Result<String, String> {
     ensure_usb_channel_available()?;
-    log_usb("INFO", "Executing clear_display command...");
     let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
-    drop(worker.take());
-
     let frame = encode_clear_run_config_frame();
-    let mut dev = match DisplaySession::open_first() {
-        Ok(d) => {
-            log_usb("INFO", "Device opened for clear_display.");
-            d
+    let config_dir = app.path().app_config_dir().ok();
+    let previous = worker.take().map(|active| Arc::clone(&active.restore));
+    match open_session("clear_display").map_err(Transfer::Failed)
+        .and_then(|mut dev| send_run_config(&mut dev, &frame).map(|_| dev))
+    {
+        Ok(dev) => {
+            let restore = Arc::new(Restore { frame, config_dir, bindings: Vec::new() });
+            *worker = Some(SyncWorker::start(Some(dev), restore));
+            Ok("Display overlay cleared successfully.".into())
         }
-        Err(e) => {
-            log_usb("ERROR", &format!("open_first failed during clear_display: {:?}", e));
-            return Err(format!("Failed to open device: {:?}", e));
+        Err(Transfer::Failed(e) | Transfer::Rejected(e)) => {
+            *worker = Some(match previous {
+                Some(previous) => SyncWorker::start(None, previous),
+                None => SyncWorker::idle(config_dir),
+            });
+            Err(e)
         }
-    };
-
-    let t0 = std::time::Instant::now();
-    if let Err(e) = dev.write_frame(&frame, Duration::from_millis(2000)) {
-        log_usb("ERROR", &format!("Bulk OUT clear_frame failed: {:?}", e));
-        return Err(format!("Write failed: {:?}", e));
-    }
-    log_usb("WRITE", &format!("Clear frame ({} bytes) in {:?}", frame.len(), t0.elapsed()));
-
-    let t1 = std::time::Instant::now();
-    let payload = match dev.read_frame(Duration::from_millis(2000)) {
-        Ok(p) => {
-            let prev = hex_preview(&p[..std::cmp::min(16, p.len())]);
-            log_usb("READ", &format!("Clear ACK ({} bytes) in {:?} | Hex: {}", p.len(), t1.elapsed(), prev));
-            p
-        }
-        Err(e) => {
-            log_usb("ERROR", &format!("Bulk IN clear_frame ACK failed: {:?}", e));
-            return Err(format!("Read failed: {:?}", e));
-        }
-    };
-
-    let total = lumien_protocol::encode_frame(&payload);
-    let ack = parse_response_frame(&total)
-        .map_err(|e| format!("Invalid ACK: {:?}", e))?;
-
-    if ack.ok {
-        log_usb("INFO", "Display overlay cleared successfully.");
-        Ok("Display overlay cleared successfully.".to_string())
-    } else {
-        log_usb("WARN", "Device rejected clear command.");
-        Err("Device rejected clear command.".to_string())
     }
 }
 
@@ -554,7 +537,7 @@ fn change_background(
         if let Err(e) = presets::save_active_preset(config, filename) {
             log_usb("WARN", &format!("Could not remember active background: {e}"));
         }
-        if let Some(restore) = &restore {
+        if let Some(restore) = restore.as_ref().filter(|restore| !restore.frame.is_empty()) {
             send_run_config(&mut dev, &restore.frame).map_err(|error| {
                 let (Transfer::Failed(e) | Transfer::Rejected(e)) = error;
                 format!("Background switched, but restoring widgets failed: {e}")
@@ -564,11 +547,17 @@ fn change_background(
     });
     match result {
         Ok(dev) => {
-            *worker = restore.map(|restore| SyncWorker::start(Some(dev), restore));
+            let restore = restore.unwrap_or_else(|| Arc::new(Restore {
+                frame: Vec::new(), config_dir: Some(config.to_owned()), bindings: Vec::new(),
+            }));
+            *worker = Some(SyncWorker::start(Some(dev), restore));
             Ok(())
         }
         Err(e) => {
-            *worker = restore.map(|restore| SyncWorker::start(None, restore));
+            *worker = Some(match restore {
+                Some(restore) => SyncWorker::start(None, restore),
+                None => SyncWorker::idle(Some(config.to_owned())),
+            });
             Err(e)
         }
     }
@@ -759,14 +748,20 @@ fn apply_scene(app: tauri::AppHandle, scene_json: String) -> Result<String, Stri
         })?;
 
     let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
-    drop(worker.take());
+    let previous = worker.take().map(|active| Arc::clone(&active.restore));
 
     // A transport failure (display still booting, asleep, or unplugged) is not final: the worker keeps the
     // layout and applies it as soon as the display answers. Only an explicit device rejection is returned.
     let restore = Arc::new(Restore { frame, config_dir: app.path().app_config_dir().ok(), bindings });
     let (dev, message) = match open_session("apply_scene").map_err(Transfer::Failed).and_then(|mut dev| send_run_config(&mut dev, &restore.frame).map(|_| dev)) {
         Ok(dev) => (Some(dev), format!("Layout active on display with live 1 Hz updates ({} widgets).", groups.len())),
-        Err(Transfer::Rejected(e)) => return Err(e),
+        Err(Transfer::Rejected(e)) => {
+            *worker = Some(match previous {
+                Some(previous) => SyncWorker::start(None, previous),
+                None => SyncWorker::idle(restore.config_dir.clone()),
+            });
+            return Err(e);
+        }
         Err(Transfer::Failed(e)) => {
             log_usb("WARN", &format!("Display not ready ({e}); layout queued for automatic apply."));
             (None, "Display is not responding yet. Lumien will apply this layout automatically as soon as it is ready.".to_string())
@@ -813,8 +808,7 @@ fn restore_display(restore: &Restore) -> Result<DisplaySession, String> {
     ensure_usb_channel_available()?;
     let mut dev = open_session("restore_display")?;
     if let Some(config) = restore.config_dir.as_deref() {
-        let media = presets::load_active_preset(config);
-        if layout_files::is_valid_media_name(&media) {
+        if let Some(media) = presets::read_active_preset(config).filter(|name| layout_files::is_valid_media_name(name)) {
             let background = if video_gallery::is_video_filename(&media) {
                 restore_video_background(config, &mut dev, &media)
             } else {
@@ -825,43 +819,52 @@ fn restore_display(restore: &Restore) -> Result<DisplaySession, String> {
             }
         }
     }
+    if restore.frame.is_empty() { return Ok(dev); }
     match send_run_config(&mut dev, &restore.frame) {
         Ok(()) => Ok(dev),
         Err(Transfer::Failed(e) | Transfer::Rejected(e)) => Err(e),
     }
 }
 
-/// Incremented by the OS power callback on every resume from sleep or hibernation.
-static RESUMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Sleeps in short steps so stop requests (new Apply, Clear, exit) are honoured quickly. False when stopped.
-fn wait_unless_stopped(stop: &AtomicBool, total: Duration) -> bool {
-    let deadline = std::time::Instant::now() + total;
-    while std::time::Instant::now() < deadline {
-        if stop.load(Ordering::SeqCst) { return false; }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    !stop.load(Ordering::SeqCst)
-}
-
 /// Owns the display handle for an applied layout: pushes 1 Hz telemetry, and when the display stops
 /// answering or the PC resumes from sleep, reconnects and restores background + layout with backoff.
-fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: &Restore) {
+fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: &Restore, recover_content: bool) {
     const MAX_BACKOFF: Duration = Duration::from_secs(10);
     log_usb("INFO", "Layout worker started (1 Hz telemetry, automatic display recovery).");
-    let mut seen_resumes = RESUMES.load(Ordering::SeqCst);
+    let mut seen_resumes = monitor_power::state().resumes;
+    let mut synced = None;
+    let mut restore_on_wake = dev.is_none() && recover_content;
     let mut backoff = Duration::from_secs(1);
     let mut failures = 0u32;
-    loop {
+    while !stop.load(Ordering::SeqCst) {
+        let state = monitor_power::state();
+        if state.resumes != seen_resumes {
+            seen_resumes = state.resumes;
+            dev = None;
+            synced = None;
+            restore_on_wake = recover_content;
+            backoff = Duration::from_secs(3);
+        }
+        let on = state.on();
         if dev.is_none() {
-            if !wait_unless_stopped(stop, backoff) { break; }
-            seen_resumes = RESUMES.load(Ordering::SeqCst);
-            match restore_display(restore) {
+            if on && restore.frame.is_empty() && !restore_on_wake
+                && !restore.config_dir.as_deref().is_some_and(monitor_power::needs_wake)
+            {
+                monitor_power::wait(state, None, stop);
+                continue;
+            }
+            if !monitor_power::wait(state, Some(backoff), stop) { continue; }
+            let result = if on && restore_on_wake {
+                restore_display(restore)
+            } else {
+                ensure_usb_channel_available().and_then(|_| open_session("monitor power"))
+            };
+            match result {
                 Ok(d) => {
                     log_usb("INFO", &format!("Display restored after {failures} failed attempt(s)."));
                     dev = Some(d);
-                    failures = 0;
-                    backoff = Duration::from_secs(1);
+                    if on { restore_on_wake = false; }
+                    synced = None;
                 }
                 Err(e) => {
                     failures += 1;
@@ -872,17 +875,28 @@ fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: 
             continue;
         }
 
-        if !wait_unless_stopped(stop, Duration::from_secs(1)) { break; }
-
-        // After sleep the display may have reset (blank screen) even if the old handle still answers.
-        let resumes = RESUMES.load(Ordering::SeqCst);
-        if resumes != seen_resumes {
-            log_usb("INFO", "System resumed from sleep; restoring display.");
+        if on && restore_on_wake {
             dev = None;
-            backoff = Duration::from_secs(3); // let USB re-enumerate before reopening
             continue;
         }
-        if restore.bindings.is_empty() { continue; }
+        if synced != Some(on) {
+            if let Some(config) = restore.config_dir.as_deref() {
+                if let Err(e) = monitor_power::sync(dev.as_mut().expect("display connected"), config, on) {
+                    log_usb("WARN", &format!("Monitor power sync failed: {e}"));
+                    dev = None;
+                    restore_on_wake = recover_content;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+            }
+            synced = Some(on);
+            failures = 0;
+            backoff = Duration::from_secs(1);
+            continue;
+        }
+
+        let telemetry = on && !restore.bindings.is_empty();
+        if !monitor_power::wait(state, telemetry.then_some(Duration::from_secs(1)), stop) { continue; }
 
         let cpu = read_cpu_load();
         let ram = read_ram_load();
@@ -917,40 +931,12 @@ fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: 
                 // A rejected update usually means the display lost the layout (reset); restore it.
                 log_usb("WARN", &format!("Telemetry tick failed ({e}); reconnecting and restoring the display."));
                 dev = None;
+                restore_on_wake = true;
                 backoff = Duration::from_secs(1);
             }
         }
     }
     log_usb("INFO", "Layout worker stopped.");
-}
-
-#[repr(C)]
-struct DeviceNotifySubscribeParameters {
-    callback: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> u32,
-    context: *mut c_void,
-}
-
-#[link(name = "powrprof")]
-extern "system" {
-    fn PowerRegisterSuspendResumeNotification(flags: u32, recipient: *const c_void, handle: *mut *mut c_void) -> u32;
-}
-
-unsafe extern "system" fn on_power_event(_context: *mut c_void, kind: u32, _setting: *mut c_void) -> u32 {
-    const PBT_APMRESUMESUSPEND: u32 = 0x7;
-    const PBT_APMRESUMEAUTOMATIC: u32 = 0x12;
-    if kind == PBT_APMRESUMEAUTOMATIC || kind == PBT_APMRESUMESUSPEND {
-        RESUMES.fetch_add(1, Ordering::SeqCst);
-    }
-    0
-}
-
-/// Subscribes to suspend/resume notifications for the life of the process (no window needed).
-fn watch_power_resume() {
-    const DEVICE_NOTIFY_CALLBACK: u32 = 2;
-    let params = Box::leak(Box::new(DeviceNotifySubscribeParameters { callback: on_power_event, context: std::ptr::null_mut() }));
-    let mut handle = std::ptr::null_mut();
-    let status = unsafe { PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, params as *const _ as *const c_void, &mut handle) };
-    if status != 0 { log_usb("WARN", &format!("Sleep/wake notifications unavailable (error {status}); display recovery relies on USB errors only.")); }
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -1132,7 +1118,10 @@ fn main() {
         .setup(|app| {
             setup_tray(app)?;
             ensure_autostart_registered();
-            watch_power_resume();
+            monitor_power::watch();
+            if let Ok(mut worker) = SYNC_WORKER.lock() {
+                *worker = Some(SyncWorker::idle(app.path().app_config_dir().ok()));
+            }
             // Start the CPU temperature helper now: LibreHardwareMonitor takes seconds to open its sensors,
             // so the startup layout apply would otherwise always begin with an empty reading.
             let _ = cpu_temperature::read();

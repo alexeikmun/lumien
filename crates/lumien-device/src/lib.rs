@@ -526,6 +526,24 @@ impl DisplaySession {
         })?
     }
 
+    pub fn display_power(&mut self) -> Result<lumien_protocol::DisplayPower, String> {
+        let timeout = Duration::from_millis(500);
+        self.write_frame(&lumien_protocol::encode_get_user_config_frame(), timeout)
+            .map_err(|e| format!("Read display settings write: {e:?}"))?;
+        let payload = self.read_frame(timeout).map_err(|e| format!("Read display settings: {e:?}"))?;
+        lumien_protocol::parse_display_power_response(&payload).map_err(|e| format!("Invalid display settings: {e:?}"))
+    }
+
+    pub fn set_display_power(&mut self, power: lumien_protocol::DisplayPower) -> Result<(), String> {
+        let timeout = Duration::from_millis(500);
+        self.write_frame(&lumien_protocol::encode_display_power_frame(power.enabled, power.brightness), timeout)
+            .map_err(|e| format!("Display power write: {e:?}"))?;
+        let payload = self.read_frame(timeout).map_err(|e| format!("Display power response: {e:?}"))?;
+        let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&payload))
+            .map_err(|e| format!("Invalid display power response: {e:?}"))?;
+        if ack.ok { Ok(()) } else { Err("Display rejected the power change".into()) }
+    }
+
     /// Transmits a media file to device eMMC via FileTransmitBegin (400) -> FileTransmitData (401) -> FileTransmitEnd (402).
     pub fn transmit_file(&mut self, file_name: &str, data: &[u8], timeout: Duration) -> Result<(), DeviceError> {
         transmit_file_with(file_name, data, |frame| {

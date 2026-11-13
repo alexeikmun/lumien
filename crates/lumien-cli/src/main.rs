@@ -87,6 +87,7 @@ fn print_usage() {
     eprintln!("  lumien-cli check-prereqs                          Check running processes and communication prerequisites");
     eprintln!("  lumien-cli get-info                               Query device OS, firmware, and serial number (read-only)");
     eprintln!("  lumien-cli set-brightness <0..100>                Send a single verified brightness transaction");
+    eprintln!("  lumien-cli display-power [on|off]                 Read or toggle display power at its current brightness");
     eprintln!("  lumien-cli set-media <file_name>                  Switch active background video on display");
     eprintln!("  lumien-cli apply-widget [--dry-run] [options]     Apply one minimal supported widget to 2240x1080 canvas");
     eprintln!("         options: --x <u32> --y <u32> --text <str> --val <u32>");
@@ -358,6 +359,34 @@ fn main() {
 
             let frame = lumien_protocol::encode_frame(&req_pkg);
             send_usb_frame(&frame, "get_file_list");
+        }
+
+        "display-power" => {
+            require_quiet_usb();
+            if ["KANALI.exe", "Screen.exe", "lumien-app.exe"].iter().any(|name| !check_process(name).is_empty()) {
+                eprintln!("Close Lumien and KANALI before changing display power.");
+                std::process::exit(2);
+            }
+            let result = (|| {
+                let mut dev = lumien_device::DisplaySession::open_first().map_err(|e| format!("Open display: {e:?}"))?;
+                let mut power = dev.display_power()?;
+                if let Some(value) = args.get(2) {
+                    power.enabled = match value.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err("Use display-power [on|off]".into()),
+                    };
+                    dev.set_display_power(power)?;
+                    let actual = dev.display_power()?;
+                    if actual != power { return Err(format!("Display readback {actual:?} differs from requested {power:?}")); }
+                }
+                println!("Display enabled: {}; brightness: {}", power.enabled, power.brightness);
+                Ok::<_, String>(())
+            })();
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
 
         "set-brightness" => {

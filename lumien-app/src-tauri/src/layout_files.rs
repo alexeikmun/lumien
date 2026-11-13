@@ -124,7 +124,7 @@ pub fn is_valid_media_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_control() || c == '/' || c == '\\')
 }
 
-fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let temporary = path.with_file_name(format!(".lumien-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));

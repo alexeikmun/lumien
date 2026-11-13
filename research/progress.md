@@ -1,5 +1,11 @@
 # Lumien Project Progress & Investigation Log
 
+## Windows monitor power synchronization — 2026-11-13
+- Added a CLI display power read/toggle using UserConfig query 104 and response 504, then DisplayConfig field 1 for panel enable and field 2 for unchanged brightness. With other USB writers stopped, the physical TRYX acknowledged and read back on → off → on, at 25% throughout. This verifies panel control through firmware settings, not power removal from the cooler.
+- Tauri subscribes to Windows session display and sleep notifications and wakes its existing USB worker when the state changes. Idle monitor-off pauses telemetry and sends panel-off once. Monitor-on restores the brightness recorded before dimming. System resume uses the existing USB reconnect and content restore path. A recovery file keeps the saved brightness available if Lumien exits while the panel is off.
+- CLI and desktop builds passed. Protocol tests (15) and desktop worker/power tests (9) passed. Windows registered the callbacks, and an independent probe received the initial display-on notification. The rebuilt desktop applied Main and continued receiving telemetry acknowledgements.
+- User confirmed the TRYX turned off with the Windows monitor and restored its content on wake. No matching off/on transactions were present in the debug log checked afterward, so this result is based on physical observation. Full PC sleep, rapid transitions, and the black-image case remain to be checked separately.
+
 ## CPU temperature correction — 2026-11-11
 - Found fabricated CPU temperature (`40 + CPU load / 4`) in preview telemetry and LCD worker. Replaced both, plus initial layout value, with shared cached CPU-only LibreHardwareMonitor Celsius readings. Uses installed KANALI library through hidden persistent PowerShell helper; prefers CPU Package / Tctl-Tdie, otherwise actual core temperatures. Never uses ACPI thermal zones or CPU load as temperature.
 - Invalid/zero/stale (>5 seconds) readings show unavailable. Helper exits on stdin closure and retries failed startup after 30 seconds. Requires installed KANALI LibreHardwareMonitor library and working CPU sensor access; no library bundled or driver installed by this change.

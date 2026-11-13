@@ -308,14 +308,14 @@ pub fn encode_get_auth_frame() -> Vec<u8> {
 /// - HeaderPb { version: 1 } (tag 1)
 /// - UserConfigPb { display_config: DisplayConfigPb { backlight_enable: true, backlight_brightness: N } } (tag 200)
 pub fn encode_brightness_frame(brightness: u8) -> Vec<u8> {
-    // DisplayConfigPb:
-    // field 1 (backlight_enable) = true
-    // field 2 (backlight_brightness) = brightness (0..100)
+    encode_display_power_frame(true, brightness)
+}
+
+/// Updates only the display submessage, keeping the current brightness while toggling power.
+pub fn encode_display_power_frame(enabled: bool, brightness: u8) -> Vec<u8> {
     let mut display_cfg = Vec::with_capacity(4);
-    encode_tag(1, 0, &mut display_cfg);
-    display_cfg.push(1); // true
-    encode_tag(2, 0, &mut display_cfg);
-    encode_varint(brightness as u64, &mut display_cfg);
+    encode_varint_field(1, enabled as u64, &mut display_cfg);
+    encode_varint_field(2, brightness as u64, &mut display_cfg);
 
     // UserConfigPb:
     // field 5 (display_config) = display_cfg
@@ -331,6 +331,72 @@ pub fn encode_brightness_frame(brightness: u8) -> Vec<u8> {
     encode_length_delimited(200, &user_cfg, &mut req_pkg);
 
     encode_frame(&req_pkg)
+}
+
+/// Read the current UserConfigPb (request 104, response 504).
+pub fn encode_get_user_config_frame() -> Vec<u8> {
+    let mut request = vec![0x0a, 0x02, 0x08, 0x01];
+    encode_length_delimited(104, &[0x0a, 0x02, b'N', b'A'], &mut request);
+    encode_frame(&request)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayPower {
+    pub enabled: bool,
+    pub brightness: u8,
+}
+
+fn visit_fields(mut bytes: &[u8], mut field: impl FnMut(u64, u64, Option<&[u8]>) -> Result<(), ProtocolError>) -> Result<(), ProtocolError> {
+    while !bytes.is_empty() {
+        let (tag, start) = decode_varint(bytes, 0)?;
+        bytes = &bytes[start..];
+        match tag & 7 {
+            0 => {
+                let (value, end) = decode_varint(bytes, 0)?;
+                field(tag >> 3, value, None)?;
+                bytes = &bytes[end..];
+            }
+            2 => {
+                let (len, start) = decode_varint(bytes, 0)?;
+                let end = start.checked_add(usize::try_from(len).map_err(|_| ProtocolError::InvalidResponse)?)
+                    .filter(|end| *end <= bytes.len()).ok_or(ProtocolError::InvalidResponse)?;
+                field(tag >> 3, 0, Some(&bytes[start..end]))?;
+                bytes = &bytes[end..];
+            }
+            wire @ (1 | 5) => {
+                bytes = bytes.get(if wire == 1 { 8.. } else { 4.. }).ok_or(ProtocolError::InvalidResponse)?;
+            }
+            _ => return Err(ProtocolError::InvalidResponse),
+        }
+    }
+    Ok(())
+}
+
+pub fn parse_display_power_response(payload: &[u8]) -> Result<DisplayPower, ProtocolError> {
+    let mut display = None;
+    visit_fields(payload, |tag, _, body| {
+        if tag == 2 && body != Some(&[]) { return Err(ProtocolError::InvalidResponse); }
+        if let (504, Some(config)) = (tag, body) {
+            visit_fields(config, |tag, _, body| {
+                if let (5, Some(body)) = (tag, body) {
+                    let mut power = DisplayPower { enabled: false, brightness: 0 };
+                    visit_fields(body, |tag, value, bytes| {
+                        match (tag, bytes) {
+                            (1, None) if value <= 1 => power.enabled = value == 1,
+                            (2, None) if value <= 100 => power.brightness = value as u8,
+                            (1 | 2, _) => return Err(ProtocolError::InvalidResponse),
+                            _ => {}
+                        }
+                        Ok(())
+                    })?;
+                    display = Some(power);
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })?;
+    display.ok_or(ProtocolError::InvalidResponse)
 }
 
 /// Precomputed 256-entry table for Castagnoli CRC32C (polynomial 0x82F63B78).
@@ -732,6 +798,15 @@ mod tests {
         assert_eq!(encode_brightness_frame(42), FIXTURE_REQ_42);
         assert_eq!(encode_brightness_frame(50), FIXTURE_REQ_50);
         assert_eq!(encode_brightness_frame(100), FIXTURE_REQ_100);
+    }
+
+    #[test]
+    fn display_power_off_preserves_brightness_and_reads_proto3_default() {
+        assert_eq!(encode_display_power_frame(false, 25),
+            b"TRYX\x0d\x00\x00\x00\x0a\x02\x08\x01\xc2\x0c\x06\x2a\x04\x08\x00\x10\x19");
+        let off = b"\x0a\x02\x08\x01\x12\x00\xc2\x1f\x04\x2a\x02\x10\x19";
+        assert_eq!(parse_display_power_response(off), Ok(DisplayPower { enabled: false, brightness: 25 }));
+        assert!(parse_display_power_response(&off[..off.len() - 1]).is_err());
     }
 
     #[test]
