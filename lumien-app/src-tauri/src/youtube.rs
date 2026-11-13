@@ -95,21 +95,38 @@ mod tests {
     }
 }
 
-/// Upload a prepared stream, activate playback and remove widget overlays.
-pub fn play(path: &Path) -> Result<String, String> {
+pub fn read_prepared(path: &Path) -> Result<(&str, Vec<u8>), String> {
     let filename = path.file_name().and_then(|s| s.to_str()).ok_or("Invalid media filename")?;
     if !filename.ends_with(".h264_2240x1080") || fs::metadata(path).map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
         return Err("Expected a prepared H.264 stream under 128 MB".into());
     }
     let data = fs::read(path).map_err(|e| e.to_string())?;
     if data.is_empty() { return Err("Empty video".into()); }
-    let mut dev = lumien_device::DisplaySession::open_first().map_err(|e| format!("Open display: {e:?}"))?;
-    dev.transmit_file(filename, &data, Duration::from_secs(10)).map_err(|e| format!("Video upload: {e:?}"))?;
-    for frame in [lumien_protocol::encode_clear_run_config_frame(), lumien_protocol::encode_work_config_frame(filename)] {
+    Ok((filename, data))
+}
+
+pub fn play_prepared(
+    dev: &mut lumien_device::DisplaySession,
+    filename: &str,
+    data: &[u8],
+    clear_overlay: bool,
+) -> Result<(), String> {
+    dev.transmit_file(filename, data, Duration::from_secs(10)).map_err(|e| format!("Video upload: {e:?}"))?;
+    let clear = clear_overlay.then(lumien_protocol::encode_clear_run_config_frame);
+    for frame in clear.into_iter().chain([lumien_protocol::encode_work_config_frame(filename)]) {
         dev.write_frame(&frame, Duration::from_secs(5)).map_err(|e| format!("Playback write: {e:?}"))?;
         let payload = dev.read_frame(Duration::from_secs(5)).map_err(|e| format!("Playback response: {e:?}"))?;
         let ack = lumien_protocol::parse_response_frame(&lumien_protocol::encode_frame(&payload)).map_err(|e| format!("Playback ACK: {e:?}"))?;
         if !ack.ok { return Err("Display rejected video playback".into()); }
     }
+    Ok(())
+}
+
+/// Diagnostic CLI playback explicitly clears the overlay.
+#[allow(dead_code)] // This module is shared with the desktop app.
+pub fn play(path: &Path) -> Result<String, String> {
+    let (filename, data) = read_prepared(path)?;
+    let mut dev = lumien_device::DisplaySession::open_first().map_err(|e| format!("Open display: {e:?}"))?;
+    play_prepared(&mut dev, filename, &data, true)?;
     Ok(filename.into())
 }

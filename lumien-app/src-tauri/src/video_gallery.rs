@@ -25,6 +25,25 @@ pub fn resolve(root: &Path, id: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+pub fn is_video_filename(name: &str) -> bool {
+    name.strip_prefix("youtube_")
+        .and_then(|name| name.strip_suffix(".mp4.h264_2240x1080"))
+        .is_some_and(|id| id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)))
+}
+
+pub fn resolve_filename(root: &Path, filename: &str) -> Result<PathBuf, String> {
+    if !is_video_filename(filename) {
+        return Err("Invalid downloaded video filename".into());
+    }
+    let jobs = fs::read_dir(root).map_err(|_| "Downloaded video library is unavailable")?;
+    jobs.flatten()
+        .filter_map(|job| job.file_name().into_string().ok())
+        .filter_map(|job| resolve(root, &format!("{job}/{filename}")).ok())
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some(filename))
+        .max()
+        .ok_or_else(|| "Downloaded background video is missing".into())
+}
+
 pub fn remove(root: &Path, id: &str) -> Result<(), String> {
     let selected = resolve(root, id)?;
     let root = root.canonicalize().map_err(|e| e.to_string())?;

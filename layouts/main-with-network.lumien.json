@@ -1,7 +1,8 @@
 {
   "bend": true,
   "bgColor": "#000000",
-  "bgType": "solid",
+  "bgFile": "youtube_GUK6zoLzZXQ.mp4.h264_2240x1080",
+  "bgType": "preset",
   "grid": true,
   "height": 1080,
   "name": "Main",
@@ -90,7 +91,7 @@
       "value": 0,
       "visible": true,
       "width": 350,
-      "x": 1340,
+      "x": 1320,
       "y": 60
     },
     {

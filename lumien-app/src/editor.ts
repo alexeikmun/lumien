@@ -2,11 +2,17 @@ import type { Scene } from './scene';
 import { sensors } from './metrics.ts';
 
 export type History = { scene: Scene; past: Scene[]; future: Scene[] };
-type Action = { type: 'commit'; scene: Scene; before?: Scene } | { type: 'preview' | 'replace'; scene: Scene } | { type: 'undo' | 'redo' };
+type Action = { type: 'commit'; scene: Scene; before?: Scene } | { type: 'preview' | 'replace'; scene: Scene } | { type: 'undo' | 'redo' } | { type: 'video-background'; filename: string };
 export const initialHistory = (scene: Scene): History => ({ scene, past: [], future: [] });
 export function historyReducer(state: History, action: Action): History {
   if (action.type === 'replace') return initialHistory(action.scene);
   if (action.type === 'preview') return { ...state, scene: action.scene };
+  if (action.type === 'video-background') {
+    return historyReducer(state, {
+      type: 'commit',
+      scene: { ...state.scene, bgType: 'preset', bgFile: action.filename },
+    });
+  }
   if (action.type === 'commit') {
     const before = action.before ?? state.scene;
     if (JSON.stringify(before) === JSON.stringify(action.scene)) return state;

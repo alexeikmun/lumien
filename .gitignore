@@ -14,3 +14,7 @@ scratch/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Assistant / Tooling metadata
+.serena/
+

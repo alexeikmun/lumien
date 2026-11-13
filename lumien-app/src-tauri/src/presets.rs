@@ -120,15 +120,15 @@ pub fn presets_dir(app_config_dir: &Path) -> PathBuf {
     app_config_dir.join("presets")
 }
 
-pub fn load_active_preset(app_config_dir: &Path) -> String {
+pub fn read_active_preset(app_config_dir: &Path) -> Option<String> {
     let active_file = presets_dir(app_config_dir).join("active_preset.txt");
-    if let Ok(content) = fs::read_to_string(&active_file) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    "default_01.mp4.h264_2240x1080".to_string()
+    let content = fs::read_to_string(active_file).ok()?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+pub fn load_active_preset(app_config_dir: &Path) -> String {
+    read_active_preset(app_config_dir).unwrap_or_else(|| "default_01.mp4.h264_2240x1080".into())
 }
 
 pub fn save_active_preset(app_config_dir: &Path, file_name: &str) -> Result<(), String> {

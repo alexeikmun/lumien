@@ -234,6 +234,17 @@ static SYNC_WORKER: Mutex<Option<SyncWorker>> = Mutex::new(None);
 struct SyncWorker {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    restore: Arc<Restore>,
+}
+
+impl SyncWorker {
+    fn start(dev: Option<DisplaySession>, restore: Arc<Restore>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_restore = Arc::clone(&restore);
+        let thread = std::thread::spawn(move || run_sync_worker(&worker_stop, dev, &worker_restore));
+        Self { stop, thread: Some(thread), restore }
+    }
 }
 
 impl Drop for SyncWorker {
@@ -452,9 +463,13 @@ fn import_kanali_presets(app: tauri::AppHandle) -> Result<Vec<PresetItem>, Strin
 }
 
 #[tauri::command]
-fn get_active_preset(app: tauri::AppHandle) -> Result<String, String> {
+fn get_active_preset(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    Ok(presets::load_active_preset(&config_dir))
+    Ok(presets::read_active_preset(&config_dir).filter(|filename| {
+        layout_files::is_valid_media_name(filename)
+            && (!video_gallery::is_video_filename(filename)
+                || video_gallery::resolve_filename(&config_dir.join("youtube"), filename).is_ok())
+    }))
 }
 
 
@@ -472,13 +487,7 @@ async fn play_downloaded_video(app: tauri::AppHandle, id: String) -> Result<Stri
     tauri::async_runtime::spawn_blocking(move || {
         let config = app.path().app_config_dir().map_err(|e| e.to_string())?;
         let path = video_gallery::resolve(&config.join("youtube"), &id)?;
-        ensure_usb_channel_available()?;
-        let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
-        drop(worker.take());
-        let filename = youtube::play(&path)?;
-        presets::save_active_preset(&config, &filename)?;
-        log_usb("INFO", &format!("Gallery playback acknowledged: {filename}"));
-        Ok("Saved video playing full screen. Apply your layout to restore widgets.".into())
+        play_video_background(&config, &path)
     }).await.map_err(|e| e.to_string())?
 }
 
@@ -500,14 +509,54 @@ async fn play_youtube(app: tauri::AppHandle, url: String) -> Result<String, Stri
         let downloader = presets::find_tool("yt-dlp.exe", &config)?;
         let ffmpeg = presets::find_ffmpeg(&config).ok_or("FFmpeg is required to convert YouTube videos")?;
         let path = youtube::prepare(&url, &config.join("youtube"), &downloader, &ffmpeg)?;
-        ensure_usb_channel_available()?;
-        let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
-        drop(worker.take());
-        let filename = youtube::play(&path)?;
-        presets::save_active_preset(&config, &filename)?;
-        log_usb("INFO", &format!("YouTube playback acknowledged: {filename}; overlays cleared"));
-        Ok("YouTube video playing full screen. Apply your layout to restore widgets.".into())
+        play_video_background(&config, &path)
     }).await.map_err(|e| e.to_string())?
+}
+
+fn play_video_background(config: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
+    let (filename, data) = youtube::read_prepared(path)?;
+    change_background(config, filename, |dev| youtube::play_prepared(dev, filename, &data, false))?;
+    Ok(filename.into())
+}
+
+fn restore_video_background(config: &std::path::Path, dev: &mut DisplaySession, filename: &str) -> Result<(), String> {
+    let path = video_gallery::resolve_filename(&config.join("youtube"), filename)?;
+    let (filename, data) = youtube::read_prepared(&path)?;
+    youtube::play_prepared(dev, filename, &data, false)
+}
+
+fn change_background(
+    config: &std::path::Path,
+    filename: &str,
+    change: impl FnOnce(&mut DisplaySession) -> Result<(), String>,
+) -> Result<(), String> {
+    ensure_usb_channel_available()?;
+    let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
+    // Dropping the old worker joins it before the next command opens the USB session.
+    let restore = worker.take().map(|active| Arc::clone(&active.restore));
+    let result = open_session("change_background").and_then(|mut dev| {
+        change(&mut dev)?;
+        if let Err(e) = presets::save_active_preset(config, filename) {
+            log_usb("WARN", &format!("Could not remember active background: {e}"));
+        }
+        if let Some(restore) = &restore {
+            send_run_config(&mut dev, &restore.frame).map_err(|error| {
+                let (Transfer::Failed(e) | Transfer::Rejected(e)) = error;
+                format!("Background switched, but restoring widgets failed: {e}")
+            })?;
+        }
+        Ok(dev)
+    });
+    match result {
+        Ok(dev) => {
+            *worker = restore.map(|restore| SyncWorker::start(Some(dev), restore));
+            Ok(())
+        }
+        Err(e) => {
+            *worker = restore.map(|restore| SyncWorker::start(None, restore));
+            Err(e)
+        }
+    }
 }
 
 /// Sends WorkConfigPb for an already-uploaded media file and waits for the device ACK.
@@ -545,47 +594,29 @@ fn set_display_background(app: tauri::AppHandle, file_name: String) -> Result<St
     if !layout_files::is_valid_media_name(&file_name) {
         return Err("Invalid background media file".into());
     }
-    ensure_usb_channel_available()?;
-    log_usb("INFO", &format!("Executing set_display_background: {}", file_name));
-
-    let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
-    drop(worker.take());
-
-    let mut dev = open_session("set_display_background")?;
-    activate_media(&mut dev, &file_name)?;
-    log_usb("INFO", "Background media switched successfully.");
-    if let Ok(config_dir) = app.path().app_config_dir() {
-        let _ = presets::save_active_preset(&config_dir, &file_name);
+    let config = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    if video_gallery::is_video_filename(&file_name) {
+        change_background(&config, &file_name, |dev| restore_video_background(&config, dev, &file_name))?;
+        return Ok("Video playing as background.".into());
     }
+    change_background(&config, &file_name, |dev| activate_media(dev, &file_name))?;
+    log_usb("INFO", "Background media switched successfully.");
     Ok(format!("Background set to {}", file_name))
 }
 
 #[tauri::command(async)]
 fn set_solid_color_background(app: tauri::AppHandle, color: String) -> Result<String, String> {
-    ensure_usb_channel_available()?;
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     let (file_name, data) = presets::get_or_create_solid_color_video(&config_dir, &color)?;
 
     log_usb("INFO", &format!("Executing set_solid_color_background: {} ({} bytes)", file_name, data.len()));
 
-    let mut worker = SYNC_WORKER.lock().map_err(|_| "USB worker lock poisoned")?;
-    drop(worker.take());
-
-    let mut dev = open_session("set_solid_color_background")?;
-
-    // 1. Transmit file to device eMMC
-    let t0 = std::time::Instant::now();
-    dev.transmit_file(&file_name, &data, Duration::from_millis(2000))
-        .map_err(|e| {
-            log_usb("ERROR", &format!("Transmit solid background failed: {:?}", e));
-            format!("Transmit solid background failed: {:?}", e)
-        })?;
-    log_usb("WRITE", &format!("Transmitted {} ({} bytes) in {:?}", file_name, data.len(), t0.elapsed()));
-
-    // 2. Activate playback context via WorkConfigPb
-    activate_media(&mut dev, &file_name)?;
+    change_background(&config_dir, &file_name, |dev| {
+        dev.transmit_file(&file_name, &data, Duration::from_millis(2000))
+            .map_err(|e| format!("Transmit solid background failed: {e:?}"))?;
+        activate_media(dev, &file_name)
+    })?;
     log_usb("INFO", &format!("Solid color background ({}) activated successfully.", color));
-    let _ = presets::save_active_preset(&config_dir, &file_name);
     Ok(format!("Solid background ({}) activated on display.", color))
 }
 
@@ -717,7 +748,7 @@ fn apply_scene(app: tauri::AppHandle, scene_json: String) -> Result<String, Stri
 
     // A transport failure (display still booting, asleep, or unplugged) is not final: the worker keeps the
     // layout and applies it as soon as the display answers. Only an explicit device rejection is returned.
-    let restore = Restore { frame, config_dir: app.path().app_config_dir().ok() };
+    let restore = Arc::new(Restore { frame, config_dir: app.path().app_config_dir().ok(), bindings });
     let (dev, message) = match open_session("apply_scene").map_err(Transfer::Failed).and_then(|mut dev| send_run_config(&mut dev, &restore.frame).map(|_| dev)) {
         Ok(dev) => (Some(dev), format!("Layout active on display with live 1 Hz updates ({} widgets).", groups.len())),
         Err(Transfer::Rejected(e)) => return Err(e),
@@ -727,10 +758,7 @@ fn apply_scene(app: tauri::AppHandle, scene_json: String) -> Result<String, Stri
         }
     };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let thread = std::thread::spawn(move || run_sync_worker(&worker_stop, dev, &restore, &bindings));
-    *worker = Some(SyncWorker { stop, thread: Some(thread) });
+    *worker = Some(SyncWorker::start(dev, restore));
     Ok(message)
 }
 
@@ -762,16 +790,24 @@ fn send_run_config(dev: &mut DisplaySession, frame: &[u8]) -> Result<(), Transfe
 struct Restore {
     frame: Vec<u8>,
     config_dir: Option<std::path::PathBuf>,
+    bindings: Vec<ActiveBinding>,
 }
 
 /// Reopens the display and re-sends the active background media, then the layout.
 fn restore_display(restore: &Restore) -> Result<DisplaySession, String> {
     ensure_usb_channel_available()?;
     let mut dev = open_session("restore_display")?;
-    if let Some(media) = restore.config_dir.as_deref().map(presets::load_active_preset).filter(|m| layout_files::is_valid_media_name(m)) {
-        // The layout matters more than the background; a missing media file must not block it.
-        if let Err(e) = activate_media(&mut dev, &media) {
-            log_usb("WARN", &format!("Restore: background {media} not re-activated: {e}"));
+    if let Some(config) = restore.config_dir.as_deref() {
+        let media = presets::load_active_preset(config);
+        if layout_files::is_valid_media_name(&media) {
+            let background = if video_gallery::is_video_filename(&media) {
+                restore_video_background(config, &mut dev, &media)
+            } else {
+                activate_media(&mut dev, &media)
+            };
+            if let Err(e) = background {
+                log_usb("WARN", &format!("Restore: background {media} not re-activated: {e}"));
+            }
         }
     }
     match send_run_config(&mut dev, &restore.frame) {
@@ -795,7 +831,7 @@ fn wait_unless_stopped(stop: &AtomicBool, total: Duration) -> bool {
 
 /// Owns the display handle for an applied layout: pushes 1 Hz telemetry, and when the display stops
 /// answering or the PC resumes from sleep, reconnects and restores background + layout with backoff.
-fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: &Restore, bindings: &[ActiveBinding]) {
+fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: &Restore) {
     const MAX_BACKOFF: Duration = Duration::from_secs(10);
     log_usb("INFO", "Layout worker started (1 Hz telemetry, automatic display recovery).");
     let mut seen_resumes = RESUMES.load(Ordering::SeqCst);
@@ -831,13 +867,13 @@ fn run_sync_worker(stop: &AtomicBool, mut dev: Option<DisplaySession>, restore: 
             backoff = Duration::from_secs(3); // let USB re-enumerate before reopening
             continue;
         }
-        if bindings.is_empty() { continue; }
+        if restore.bindings.is_empty() { continue; }
 
         let cpu = read_cpu_load();
         let ram = read_ram_load();
         let (gpu_temp, gpu_load) = read_gpu_telemetry();
         let network = read_network_rates();
-        let updates: Vec<_> = bindings.iter().map(|b| {
+        let updates: Vec<_> = restore.bindings.iter().map(|b| {
             let value = match b.sensor.as_str() {
                 "CPU load" => Some(cpu as f64),
                 "CPU temperature" => cpu_temperature::read(),
@@ -1148,7 +1184,8 @@ mod sync_tests {
             while !worker_stop.load(Ordering::SeqCst) { std::thread::yield_now(); }
             finished.store(true, Ordering::SeqCst);
         });
-        drop(SyncWorker { stop, thread: Some(thread) });
+        let restore = Arc::new(Restore { frame: vec![], config_dir: None, bindings: vec![] });
+        drop(SyncWorker { stop, thread: Some(thread), restore });
         assert!(stopped.load(Ordering::SeqCst), "next USB command must wait for old worker");
     }
 

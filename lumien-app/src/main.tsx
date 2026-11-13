@@ -142,6 +142,14 @@ const store = (key: string, value: string) => { try { localStorage.setItem(key, 
 type DownloadedVideo = { id: string; title: string; duration: number; bytes: number; thumbnail: string };
 type LayoutOption = { path: string; name: string };
 type BgTab = 'presets' | 'solid' | 'video';
+const isDownloadedVideo = (filename?: string) => /^youtube_[\w-]{11}\.mp4\.h264_2240x1080$/.test(filename ?? '');
+
+function withBackgroundFile(layout: Scene, filename: string): Scene {
+  const solid = /^solid_([0-9a-f]{6})\.mp4\.h264_2240x1080$/i.exec(filename);
+  return solid
+    ? { ...layout, bgType: 'solid', bgColor: `#${solid[1].toLowerCase()}`, bgFile: undefined }
+    : { ...layout, bgType: 'preset', bgFile: filename };
+}
 
 function App() {
   const desktop = '__TAURI_INTERNALS__' in window;
@@ -150,7 +158,7 @@ function App() {
   const [downloadedVideos, setDownloadedVideos] = useState<DownloadedVideo[]>([]);
   const [galleryError, setGalleryError] = useState('');
   const [galleryLoading, setGalleryLoading] = useState(false);
-  const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
+  const [playingVideo, setPlayingVideo] = useState<string | null>(null);
   const [layouts, setLayouts] = useState<LayoutOption[]>([]);
   const [{ scene, past, future }, dispatch] = useReducer(historyReducer, undefined, () => initialHistory(sample()));
   const [selected, select] = useState<string | null>(null),
@@ -227,19 +235,24 @@ function App() {
     fileOperation.current = true;
     invoke<{ path: string; content: string } | null>('restore_layout')
       .then(async (file) => {
-        if (active && file) {
-          const restored = await hydrateBackground(parseScene(file.content));
-          if (!active) return;
-          replaceDocument(restored, file.path, false);
+        const activeFile = await invoke<string | null>('get_active_preset');
+        if (!active) return;
+        if (file || activeFile) {
+          const layout = file ? parseScene(file.content) : sample();
+          const restored = activeFile ? withBackgroundFile(layout, activeFile) : layout;
+          if (file) replaceDocument(restored, file.path, false);
+          else dispatch({ type: 'replace', scene: restored });
           startupApply.current = restored;
-          if (restored.bgType === 'solid') {
+          if (isDownloadedVideo(restored.bgFile) && restored.bgType !== 'solid') {
+            setBgSubtab('video');
+          } else if (restored.bgType === 'solid') {
             setBgSubtab('solid');
             if (restored.bgColor) {
               setSolidColor(restored.bgColor);
               setHexInput(restored.bgColor.toUpperCase());
             }
           }
-          setStatus('Reopened ' + file.path);
+          if (file) setStatus('Reopened ' + file.path);
         }
       })
       .catch((e) => { if (active) setStatus('Could not reopen last layout: ' + String(e)); })
@@ -270,9 +283,10 @@ function App() {
     }
     if (scene.bgFile) {
       const preset = presets.find((item) => item.file_name === scene.bgFile);
+      const video = downloadedVideos.find((item) => item.id.endsWith('/' + scene.bgFile));
       setActivePresetFile(scene.bgFile);
-      setPreviewBackground(preset?.thumbnail ?? '');
-      if (!preset && !presetsLoading && presets.length) setStatus(`Background preview unavailable for saved media: ${scene.bgFile}. Apply will still send its saved filename to the LCD.`);
+      setPreviewBackground(preset?.thumbnail ?? video?.thumbnail ?? '');
+      if (!preset && !isDownloadedVideo(scene.bgFile) && !presetsLoading && presets.length) setStatus(`Background preview unavailable for saved media: ${scene.bgFile}. Apply will still send its saved filename to the LCD.`);
       return;
     }
     const active = presets.find((item) => item.is_active);
@@ -280,7 +294,7 @@ function App() {
       setActivePresetFile(active.file_name);
       setPreviewBackground(active.thumbnail);
     }
-  }, [scene.bgType, scene.bgColor, scene.bgFile, presets, presetsLoading]);
+  }, [scene.bgType, scene.bgColor, scene.bgFile, presets, presetsLoading, downloadedVideos]);
 
   // Runs a device operation with the shared busy lock so double clicks never interleave USB uploads.
   async function exclusive(task: () => Promise<void>) {
@@ -312,15 +326,14 @@ function App() {
 
   const applyPreset = (p: PresetItem) => exclusive(async () => {
     if (!desktop) return;
+    commit({ ...scene, bgType: 'preset', bgFile: p.file_name });
     setStatus(`Applying background “${p.name}”…`);
     try {
       await invoke('set_display_background', { fileName: p.file_name });
       setActivePresetFile(p.file_name);
       setPreviewBackground(p.thumbnail);
       setPresets((prev) => prev.map((item) => ({ ...item, is_active: item.file_name === p.file_name })));
-      const updatedScene: Scene = { ...scene, bgType: 'preset', bgFile: p.file_name };
-      commit(updatedScene);
-      if (scene.widgets.some((widget) => widget.visible)) await device.applyScene(updatedScene);
+      setPlayingVideo(null);
       setStatus(`Background “${p.name}” applied.`);
     } catch (err) {
       setStatus(`Failed to apply background: ${err}`);
@@ -376,7 +389,7 @@ function App() {
         setActivePresetFile('');
         setPreviewBackground('');
       }
-      if (scene.widgets.some((widget) => widget.visible)) await device.applyScene(updatedScene);
+      setPlayingVideo(null);
       setStatus(`Solid background ${norm.toUpperCase()} applied.`);
     } catch (err) {
       setStatus(`Failed to apply solid color: ${err}`);
@@ -386,10 +399,7 @@ function App() {
   const applyToDisplay = () => exclusive(async () => {
     setStatus('Applying layout to display…');
     try {
-      if (desktop) {
-        if (previewScene.bgType === 'solid') await invoke('set_solid_color_background', { color: previewScene.bgColor });
-        else if (previewScene.bgFile) await invoke('set_display_background', { fileName: previewScene.bgFile });
-      }
+      await applyBackground(previewScene);
       setStatus(await device.applyScene(parseScene(JSON.stringify(previewScene))));
     } catch (e) {
       setStatus(String(e));
@@ -400,13 +410,28 @@ function App() {
     try { setStatus(await device.clearDisplay()); } catch (e) { setStatus(String(e)); }
   });
 
-  async function playVideo(label: string, run: () => Promise<string>, after?: () => void) {
-    if (busy) return;
-    setYoutubeBusy(true); setBusy(true); setStatus(label);
-    try { setStatus(await run()); after?.(); }
-    catch (error) { setStatus('Video playback failed: ' + String(error)); }
-    finally { setYoutubeBusy(false); setBusy(false); }
+  async function applyBackground(layout: Scene) {
+    if (!desktop) return;
+    if (layout.bgType === 'solid') {
+      await invoke('set_solid_color_background', { color: layout.bgColor });
+      setPlayingVideo(null);
+    } else if (layout.bgFile) {
+      await invoke('set_display_background', { fileName: layout.bgFile });
+      setPlayingVideo(isDownloadedVideo(layout.bgFile) ? layout.bgFile : null);
+    }
   }
+
+  const playVideo = (label: string, run: () => Promise<string>) => exclusive(async () => {
+    setYoutubeBusy(true); setStatus(label);
+    try {
+      const filename = await run();
+      dispatch({ type: 'video-background', filename });
+      setPlayingVideo(filename);
+      setStatus('Video playing as background.');
+    }
+    catch (error) { setStatus('Video playback failed: ' + String(error)); }
+    finally { setYoutubeBusy(false); }
+  });
 
   async function removeVideo(video: DownloadedVideo) {
     if (busy || !window.confirm(`Remove “${video.title}” and all duplicate downloads from this computer?`)) return;
@@ -414,7 +439,7 @@ function App() {
     try {
       await invoke('remove_downloaded_video', { id: video.id });
       setDownloadedVideos(items => items.filter(item => item.id !== video.id));
-      if (selectedVideo === video.id) setSelectedVideo(null);
+      if (video.id.endsWith('/' + playingVideo)) setPlayingVideo(null);
       setStatus('Downloaded video and duplicate copies removed.');
     } catch (error) { setStatus('Could not remove video: ' + String(error)); }
     finally { setBusy(false); }
@@ -432,27 +457,22 @@ function App() {
     setBusy(true);
     setStatus('Applying restored layout to display…');
     void (async () => {
+      let backgroundError = '';
       try {
-        // At boot the display may still be starting. A failed background step must not skip the layout:
-        // apply_scene queues it and the backend worker re-sends the saved background once the display answers.
         try {
-          if (desktop) {
-            if (restored.bgType === 'solid') {
-              await invoke('set_solid_color_background', { color: restored.bgColor });
-            } else if (restored.bgFile) {
-              await invoke('set_display_background', { fileName: restored.bgFile });
-            }
-          }
+          await applyBackground(restored);
         } catch (e) {
-          console.warn('Startup background not applied yet:', e);
+          backgroundError = ' Background restore failed: ' + String(e);
         }
-        const message = await device.applyScene(parseScene(JSON.stringify(withTelemetry(restored, readings))));
-        setStatus('Startup apply: ' + message);
+        const message = filePath
+          ? await device.applyScene(parseScene(JSON.stringify(withTelemetry(restored, readings))))
+          : 'Background restored.';
+        setStatus(filePath ? 'Startup apply: ' + message + backgroundError : backgroundError.trim() || message);
       } catch (e) {
         setStatus('Startup apply failed: ' + String(e) + '. Use Apply to display to retry.');
       } finally { setBusy(false); }
     })();
-  }, [desktop, starting, fileBusy, pending, busy, deviceState.connected, scene]);
+  }, [desktop, starting, fileBusy, pending, busy, deviceState.connected, scene, filePath]);
 
   useEffect(() => {
     const r = new ResizeObserver(() => {
@@ -637,11 +657,8 @@ function App() {
 
   async function hydrateBackground(layout: Scene): Promise<Scene> {
     if (layout.bgType !== 'preset' || layout.bgFile) return layout;
-    const activeFile = await invoke<string>('get_active_preset');
-    const solid = /^solid_([0-9a-f]{6})\.mp4\.h264_2240x1080$/i.exec(activeFile);
-    return solid
-      ? { ...layout, bgType: 'solid', bgColor: `#${solid[1].toLowerCase()}` }
-      : { ...layout, bgFile: activeFile };
+    const activeFile = await invoke<string | null>('get_active_preset');
+    return activeFile ? withBackgroundFile(layout, activeFile) : layout;
   }
 
   async function save(saveAs = false): Promise<boolean> {
@@ -973,24 +990,26 @@ function App() {
                       </label>
                       <button className="primary block" disabled={!desktop || !deviceState.connected || busy || !youtubeUrl.trim()}
                         onClick={() => void playVideo('Downloading, converting and uploading the video…', () => invoke<string>('play_youtube', { url: youtubeUrl.trim() }))}>
-                        <Icon name="play" /> Play full screen
+                        <Icon name="play" /> Play as background
                       </button>
-                      <p className="hint">Up to 5 minutes, silent, cropped to fill the panel. Widgets are hidden while it plays.</p>
+                      <p className="hint">Up to 5 minutes, silent, cropped to fill the panel behind your widgets.</p>
                     </div>
                     <h2 className="section-title" style={{ marginTop: 18 }}>Downloaded <span className="count">{downloadedVideos.length}</span></h2>
                     {galleryLoading && <p className="hint" role="status">Loading videos…</p>}
                     {galleryError && <p className="hint error" role="alert">{galleryError}</p>}
                     {!galleryLoading && !galleryError && downloadedVideos.length === 0 && <p className="hint">Videos you play appear here for quick replay.</p>}
                     <div className="video-list">
-                      {downloadedVideos.map(video => (
-                        <article key={video.id} className={`video-card ${selectedVideo === video.id ? 'selected' : ''}`}>
+                      {downloadedVideos.map(video => {
+                        const isPlaying = playingVideo !== null && video.id.endsWith('/' + playingVideo);
+                        return (
+                        <article key={video.id} className={`video-card ${isPlaying ? 'selected' : ''}`}>
                           <button type="button" className="video-play" disabled={busy || !deviceState.connected}
-                            aria-pressed={selectedVideo === video.id} title={`Play ${video.title} on the display`}
-                            onClick={() => void playVideo('Uploading saved video to the display…', () => invoke<string>('play_downloaded_video', { id: video.id }), () => setSelectedVideo(video.id))}>
+                            aria-pressed={isPlaying} title={`Play ${video.title} on the display`}
+                            onClick={() => void playVideo('Uploading saved video to the display…', () => invoke<string>('play_downloaded_video', { id: video.id }))}>
                             {video.thumbnail ? <img className="thumb" src={video.thumbnail} alt="" /> : <span className="thumb empty"><Icon name="play" size={22} /></span>}
                             <span className="preset-meta">
                               <strong>{video.title}</strong>
-                              <span className="tag">{Math.floor(video.duration / 60)}:{String(Math.floor(video.duration % 60)).padStart(2, '0')} · {(video.bytes / 1048576).toFixed(1)} MB{selectedVideo === video.id ? ' · Playing' : ''}</span>
+                              <span className="tag">{Math.floor(video.duration / 60)}:{String(Math.floor(video.duration % 60)).padStart(2, '0')} · {(video.bytes / 1048576).toFixed(1)} MB{isPlaying ? ' · Playing' : ''}</span>
                             </span>
                           </button>
                           <button type="button" className="video-delete" disabled={busy}
@@ -999,7 +1018,8 @@ function App() {
                             <Icon name="trash" size={15} />
                           </button>
                         </article>
-                      ))}
+                        );
+                      })}
                     </div>
                   </>
                 )}
