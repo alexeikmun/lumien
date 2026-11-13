@@ -1,28 +1,29 @@
-<# Read-only PnP polling plus Lumien transaction-log tail. PnP events use a separate file. #>
+<# Read-only PnP polling with optional transaction-log tail. #>
 [CmdletBinding()]
 param(
-    [string]$LogFile = "$env:USERPROFILE\Desktop\tryx_usb_transactions.log",
+    [string]$LogFile = "",
     [string]$EventLogFile = "",
     [ValidateRange(0, 2147483647)][int]$Samples = 0,
     [ValidateRange(0, 60000)][int]$PollMilliseconds = 250
 )
-if (-not $EventLogFile) { $EventLogFile = "$LogFile.pnp.log" }
-if ([IO.Path]::GetFullPath($EventLogFile) -eq [IO.Path]::GetFullPath($LogFile)) {
-    throw "PnP event log must differ from transaction log (avoids duplicate output)."
+if ($EventLogFile) {
+    if ($LogFile -and [IO.Path]::GetFullPath($EventLogFile) -eq [IO.Path]::GetFullPath($LogFile)) {
+        throw "PnP event log must differ from transaction log (avoids duplicate output)."
+    }
+    $eventDir = Split-Path -Parent ([IO.Path]::GetFullPath($EventLogFile))
+    [IO.Directory]::CreateDirectory($eventDir) | Out-Null
 }
-$eventDir = Split-Path -Parent ([IO.Path]::GetFullPath($EventLogFile))
-[IO.Directory]::CreateDirectory($eventDir) | Out-Null
 $instancePattern = 'USB\VID_391A&PID_1021\*'
 $lastState = $null
-$filePosition = if (Test-Path -LiteralPath $LogFile) { (Get-Item -LiteralPath $LogFile).Length } else { 0 }
+$filePosition = if ($LogFile -and (Test-Path -LiteralPath $LogFile)) { (Get-Item -LiteralPath $LogFile).Length } else { 0 }
 function Log-Message([string]$level, [string]$msg, [ConsoleColor]$color) {
     $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [$level] $msg"
     Write-Host $line -ForegroundColor $color
-    Add-Content -LiteralPath $EventLogFile -Value $line -Encoding UTF8
+    if ($EventLogFile) { Add-Content -LiteralPath $EventLogFile -Value $line -Encoding UTF8 }
 }
 Write-Host "Lumien read-only USB monitor. Poll timestamps are observations, not exact bus-event times."
-Write-Host "Transactions: $LogFile"
-Write-Host "PnP events: $EventLogFile"
+if ($LogFile) { Write-Host "Transactions: $LogFile" }
+if ($EventLogFile) { Write-Host "PnP events: $EventLogFile" }
 $sample = 0
 while ($Samples -eq 0 -or $sample -lt $Samples) {
     $sample++
@@ -45,7 +46,7 @@ while ($Samples -eq 0 -or $sample -lt $Samples) {
         # A failed PnP query is not a device removal.
         Log-Message 'QUERY-ERROR' $_.Exception.Message 'Yellow'
     }
-    if (Test-Path -LiteralPath $LogFile) {
+    if ($LogFile -and (Test-Path -LiteralPath $LogFile)) {
         $length = (Get-Item -LiteralPath $LogFile).Length
         if ($length -lt $filePosition) { $filePosition = 0 }
         if ($length -gt $filePosition) {

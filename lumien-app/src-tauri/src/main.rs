@@ -76,7 +76,7 @@ fn hex_preview(data: &[u8]) -> String {
 #[inline]
 #[allow(unused_variables)]
 fn log_usb(level: &str, msg: &str) {
-    // ponytail: debug transaction log disabled in release builds (not(debug_assertions)).
+    // USB diagnostics go to the debug console.
     #[cfg(debug_assertions)]
     {
         let mut st = std::mem::MaybeUninit::<SYSTEMTIME>::uninit();
@@ -88,13 +88,6 @@ fn log_usb(level: &str, msg: &str) {
             level, msg
         );
         print!("{}", line);
-        if let Ok(user_profile) = std::env::var("USERPROFILE") {
-            let log_path = format!("{}\\Desktop\\tryx_usb_transactions.log", user_profile);
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                let _ = file.write_all(line.as_bytes());
-            }
-        }
     }
 }
 
